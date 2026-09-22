@@ -140,7 +140,7 @@
     text-decoration-color:var(--line); text-underline-offset:3px; cursor:pointer; }
   .dayactions{ margin-top:12px; display:flex; gap:8px; }
   .exlink{ cursor:pointer; text-decoration:underline; text-decoration-color:var(--line); text-underline-offset:3px; }
-  .exnote{ display:block; font-size:12px; color:var(--text-muted); font-style:normal; margin-top:2px; }
+  .exnote{ display:block; font-size:12px; font-weight:400; color:var(--text-muted); font-style:normal; margin-top:2px; }
   .dtag.live{ background:rgba(201,162,39,.15); color:var(--gold); }
 
   .vtitle{ font:600 28px/1.1 "Barlow Condensed",sans-serif; margin:2px 0 6px; }
@@ -214,6 +214,8 @@
   .sheetbtns .btn{ flex:1; }
   .msg{ font-size:13px; color:var(--text-muted); margin:10px 0 0; line-height:1.5; }
   .msg.err{ color:var(--iron); }
+  .msglist{ margin:6px 0 0; padding-left:18px; font-size:12px; line-height:1.5; color:var(--text-muted); }
+  .msglist.err{ color:var(--iron); }
   pre.summary{ white-space:pre-wrap; font-size:12px; background:var(--surface-2); padding:10px; border-radius:3px; max-height:40vh; overflow:auto; }
 </style>
 </head>
@@ -233,7 +235,7 @@ const REX = 'ROUTINE_EXERCISES';
 const MAIN_LIFTS = [['back_squat','Sentadilla', null], ['weighted_pullup','Dominada +', null], ['weighted_dip','Fondo +', null], ['muscle_up','Muscle up +', 0]];
 function mainMax(id) { const v = refMax(id); if (v != null) return v; const m = MAIN_LIFTS.find((x) => x[0] === id); return m ? m[2] : null; }
 const DAYTYPE_LABEL = { heavy:'Pesado', tech:'Técnica', rest:'Descanso' };
-const ROLES = [['main','Principal'], ['accessory','Accesorio'], ['technique','Técnica'], ['mobility','Movilidad'], ['skill','Skill']];
+const ROLES = [['main','Principal'], ['secondary','Secundario'], ['accessory','Accesorio'], ['technique','Técnica'], ['mobility','Movilidad'], ['skill','Skill']];
 const EX_TYPES = [['main','Principal'], ['variant','Variante'], ['accessory','Accesorio'], ['technique','Técnica'], ['mobility','Movilidad'], ['skill','Skill']];
 const LOAD_MODES = [['barbell','Barra (peso total)'], ['added_weight','Lastre (peso corporal + kg)'], ['external','Carga externa'], ['bodyweight','Peso corporal'], ['time','Por tiempo']];
 const LOAD_TYPES = [['','Sin carga fija'], ['pct','% del máximo'], ['kg','kg'], ['added_kg','Lastre (kg)'], ['bodyweight','Peso corporal']];
@@ -371,7 +373,7 @@ function prescribedLoad(r, date) {
   return null;
 }
 function specText(r) {
-  if (r.sets != null && r.reps != null && r.reps !== '') return r.sets + '×' + r.reps + (r.unit === 's' ? ' s' : '');
+  if (r.sets != null && r.reps != null && r.reps !== '') return r.sets + '×' + r.reps + (r.unit === 's' ? ' s' : r.unit === 'm' ? ' m' : '');
   if (r.sets != null) return r.sets + ' series';
   return '';
 }
@@ -597,25 +599,92 @@ function slugUnique(name) {
 
 /* ---------- Importar bloque / resumen para Claude ---------- */
 const IMPORTABLE = ['PROFILE', 'EXERCISES', 'ROUTINES', 'ROUTINE_DAYS', 'ROUTINE_EXERCISES', 'GOALS', 'BODY_METRICS'];
+const IMPORT_FIELDS = {
+  PROFILE: ['key', 'value'],
+  EXERCISES: ['exercise_id', 'name', 'category', 'type', 'load_mode', 'notes'],
+  ROUTINES: ['routine_id', 'name', 'start_date', 'weeks', 'week_labels', 'status', 'notes'],
+  ROUTINE_DAYS: ['day_id', 'routine_id', 'day_index', 'name', 'type', 'cue'],
+  ROUTINE_EXERCISES: ['rex_id', 'day_id', 'exercise_id', 'week_from', 'week_to', 'position', 'role', 'sets', 'reps', 'unit', 'load_type', 'load_value', 'pct_of', 'rir', 'rest_sec', 'notes'],
+  GOALS: ['goal_id', 'exercise_id', 'description', 'target_value', 'target_date', 'status'],
+  BODY_METRICS: ['metric_id', 'date', 'metric', 'value', 'notes']
+};
+const codesOf = (list) => list.map((x) => x[0]).filter(Boolean);
+const normName = (x) => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+/* Valida el bloque contra el formato de la app ANTES de importar: si algo no encaja, no se importa nada. */
 function parseImport(text) {
   let o; try { o = JSON.parse(text); } catch (e) { return { error: 'No es un JSON válido.' }; }
   const tables = o && o.tables;
   if (!tables || typeof tables !== 'object') return { error: 'Falta la clave "tables".' };
-  const out = {};
+  const errors = []; const warnings = []; const out = {};
+  const E = (m) => { if (errors.indexOf(m) === -1) errors.push(m); };
   for (const t in tables) {
-    if (IMPORTABLE.indexOf(t) === -1) return { error: 'La tabla ' + t + ' no se puede importar (el historial solo se registra entrenando).' };
-    if (!Array.isArray(tables[t])) return { error: t + ' debe ser una lista.' };
-    for (const r of tables[t]) if (!r || !r[PK[t]]) return { error: 'Hay una fila de ' + t + ' sin ' + PK[t] + '.' };
-    out[t] = tables[t];
+    if (!IMPORT_FIELDS[t]) { E('La tabla ' + t + ' no se puede importar (el historial solo se registra entrenando).'); continue; }
+    if (!Array.isArray(tables[t])) { E(t + ' debe ser una lista.'); continue; }
+    const unknown = new Set();
+    out[t] = tables[t].map((r, i) => {
+      if (!r || !r[PK[t]]) { E(t + ', fila ' + (i + 1) + ': falta ' + PK[t] + '.'); return null; }
+      const c = {};
+      for (const k in r) { if (IMPORT_FIELDS[t].indexOf(k) !== -1) c[k] = r[k]; else unknown.add(k); }
+      return c;
+    }).filter(Boolean);
+    if (unknown.size) warnings.push(t + ': se ignoran los campos ' + Array.from(unknown).join(', ') + '.');
   }
-  const exIds = new Set(Object.keys(db.tables.EXERCISES).concat((out.EXERCISES || []).map((e) => e.exercise_id)));
-  for (const r of (out.ROUTINE_EXERCISES || [])) if (!exIds.has(r.exercise_id)) return { error: 'El ejercicio "' + r.exercise_id + '" no existe en la biblioteca ni en el bloque.' };
+  if (errors.length) return { error: errors, warnings };
+  const inBlock = (t) => new Map((out[t] || []).map((r) => [r[PK[t]], r]));
+  const EXb = inBlock('EXERCISES'), RTb = inBlock('ROUTINES'), DYb = inBlock('ROUTINE_DAYS');
+  const byName = {}; rows('EXERCISES').forEach((e) => { byName[normName(e.name)] = e.exercise_id; });
+  (out.EXERCISES || []).forEach((e) => {
+    const cur = db.tables.EXERCISES[e.exercise_id]; const tag = 'Ejercicio ' + e.exercise_id + ': ';
+    if (!cur) {
+      if (!e.name) E(tag + 'falta name.');
+      const dup = byName[normName(e.name)];
+      if (dup && dup !== e.exercise_id) E('"' + e.name + '" ya existe con el ID ' + dup + '. Hay que usar ese ID para no partir el historial.');
+      if (codesOf(LOAD_MODES).indexOf(e.load_mode) === -1) E(tag + 'load_mode debe ser ' + codesOf(LOAD_MODES).join(', ') + '.');
+    } else if (e.load_mode != null && codesOf(LOAD_MODES).indexOf(e.load_mode) === -1) E(tag + 'load_mode no válido.');
+    if (e.type != null && codesOf(EX_TYPES).indexOf(e.type) === -1) E(tag + 'type debe ser ' + codesOf(EX_TYPES).join(', ') + '.');
+  });
+  (out.ROUTINES || []).forEach((r) => {
+    const tag = 'Rutina ' + r.routine_id + ': ';
+    if (['active', 'completed', 'draft'].indexOf(r.status) === -1) E(tag + 'falta status ("active" para que se muestre).');
+    if (!Number.isInteger(r.weeks) || r.weeks < 1) E(tag + 'weeks debe ser un número entero.');
+  });
+  (out.ROUTINE_DAYS || []).forEach((d) => {
+    const tag = 'Día ' + d.day_id + ': ';
+    if (!RTb.has(d.routine_id) && !db.tables.ROUTINES[d.routine_id]) E(tag + 'la rutina ' + d.routine_id + ' no existe.');
+    if (!Number.isInteger(d.day_index)) E(tag + 'falta day_index (número de día).');
+    if (['heavy', 'tech', 'rest'].indexOf(d.type) === -1) E(tag + 'type debe ser heavy, tech o rest.');
+    const cur = db.tables.ROUTINE_DAYS[d.day_id];
+    if (cur && cur.routine_id !== d.routine_id) E(tag + 'ese ID ya lo usa otra rutina. Cada bloque necesita IDs nuevos.');
+  });
+  const refs = new Set(rows('PROFILE').concat(out.PROFILE || []).map((p) => p.key).filter((k) => String(k).indexOf('ref_max.') === 0).map((k) => k.slice(8)));
+  (out.ROUTINE_EXERCISES || []).forEach((r) => {
+    const tag = 'Prescripción ' + r.rex_id + ': ';
+    const day = DYb.get(r.day_id) || db.tables.ROUTINE_DAYS[r.day_id];
+    if (!day) E(tag + 'el día ' + r.day_id + ' no existe.');
+    if (!EXb.has(r.exercise_id) && !db.tables.EXERCISES[r.exercise_id]) E(tag + 'el ejercicio ' + r.exercise_id + ' no existe en la biblioteca ni en el bloque.');
+    if (r.load_type != null && codesOf(LOAD_TYPES).concat(['']).indexOf(r.load_type) === -1) E(tag + 'load_type "' + r.load_type + '" no válido (pct, kg, added_kg, bodyweight o null).');
+    if (r.load_type === 'pct') {
+      if (r.load_value == null) E(tag + 'falta load_value (el porcentaje).');
+      if (!r.pct_of || !refs.has(r.pct_of)) E(tag + 'pct_of debe ser un ejercicio con máximo de referencia (' + Array.from(refs).join(', ') + ').');
+    }
+    if (r.unit != null && ['reps', 's', 'm'].indexOf(r.unit) === -1) E(tag + 'unit debe ser reps, s o m.');
+    if (!Number.isInteger(r.week_from) || !Number.isInteger(r.week_to) || r.week_from > r.week_to) E(tag + 'week_from y week_to deben ser números con week_from ≤ week_to.');
+    const cur = db.tables[REX][r.rex_id];
+    if (cur && day) { const cd = db.tables.ROUTINE_DAYS[cur.day_id]; if (cd && cd.routine_id !== day.routine_id) E(tag + 'ese ID ya lo usa otra rutina. Cada bloque necesita IDs nuevos.'); }
+  });
+  if ((out.ROUTINES || []).length && !(out.ROUTINES || []).some((r) => r.status === 'active')) warnings.push('Ninguna rutina viene como "active": se importa, pero no se va a mostrar.');
+  if (errors.length) return { error: errors, warnings };
   const counts = {}; for (const t in out) counts[t] = out[t].length;
-  return { tables: out, counts };
+  return { tables: out, counts, warnings };
 }
 function applyImport(p) {
   const newActive = (p.tables.ROUTINES || []).filter((r) => r.status === 'active').map((r) => r.routine_id);
-  IMPORTABLE.forEach((t) => (p.tables[t] || []).forEach((r) => put(t, stripMeta(r))));
+  IMPORTABLE.forEach((t) => (p.tables[t] || []).forEach((r) => {
+    const c = stripMeta(r);
+    if (t === REX) { if (c.reps != null) c.reps = String(c.reps); if (c.rir != null) c.rir = String(c.rir); }
+    if (t === 'PROFILE' && c.value != null) c.value = String(c.value);
+    put(t, c);
+  }));
   if (newActive.length) rows('ROUTINES').forEach((r) => { if (r.status === 'active' && newActive.indexOf(r.routine_id) === -1) put('ROUTINES', { routine_id: r.routine_id, status: 'completed' }); });
   ui.week = null; ui.editWeek = null;
   changed(true);
@@ -645,6 +714,15 @@ function buildSummary() {
     let best = null; historyOf(ex.exercise_id).forEach((g) => g.sets.forEach((x) => { const v = e1rm(x, ex.exercise_id, g.ses.date); if (v != null && (!best || v > best.v)) best = { v, d: g.ses.date }; }));
     if (best) L.push('  ' + ex.name + ': ' + (ex.load_mode === 'added_weight' ? '+' : '') + fmt(Math.round(best.v * 10) / 10) + ' kg (' + best.d + ')');
   });
+  L.push(''); L.push('FORMATO PARA IMPORTAR EL PRÓXIMO BLOQUE EN LA APP');
+  L.push('JSON: {"format":"streetlifting-block-v1","tables":{...}}. IDs nuevos y únicos en cada bloque (ej. rtn_b3, day_b3_1, rex_b3_d1_01_w1); nunca reutilizar IDs de bloques anteriores.');
+  L.push('ROUTINES: routine_id, name, weeks (entero), week_labels ("A|B|C|D"), status ("active"), start_date (YYYY-MM-DD), notes');
+  L.push('ROUTINE_DAYS: day_id, routine_id, day_index (entero), name, type (heavy|tech|rest), cue (indicación técnica)');
+  L.push('ROUTINE_EXERCISES: rex_id, day_id, exercise_id, week_from, week_to, position, role (' + codesOf(ROLES).join('|') + '), sets, reps (texto: "5" o "8-10"), unit (reps|s|m), load_type (pct|kg|added_kg|bodyweight|null), load_value, pct_of (solo con pct: ' + rows('PROFILE').map((p) => p.key).filter((k) => k.indexOf('ref_max.') === 0).map((k) => k.slice(8)).join('|') + '), rir (texto), rest_sec, notes');
+  L.push('EXERCISES (solo ejercicios nuevos): exercise_id, name, category, type (' + codesOf(EX_TYPES).join('|') + '), load_mode (' + codesOf(LOAD_MODES).join('|') + '), notes');
+  L.push('PROFILE (opcional, para cambiar máximos): key "ref_max.<exercise_id>", value');
+  L.push('Ejercicios que ya existen (usar SIEMPRE estos IDs para no partir el historial):');
+  rows('EXERCISES').sort((a, b) => a.name.localeCompare(b.name, 'es')).forEach((e) => L.push('  ' + e.exercise_id + ' — ' + e.name + ' (' + e.load_mode + ')'));
   return L.join('\n');
 }
 
@@ -707,9 +785,9 @@ function viewHome() {
     (rt.notes ? '<p class="warmup">' + esc(rt.notes) + '</p>' : '');
 }
 
-function setHead(mode, timeBased) {
+function setHead(mode, timeBased, repLabel) {
   const kg = (mode === 'added_weight' || mode === 'bodyweight') ? '+kg' : 'kg';
-  return '<div class="setrow head"><span>#</span><span>' + kg + '</span><span>' + (timeBased ? 'seg' : 'reps') + '</span><span>RIR</span><span>tipo</span><span></span></div>';
+  return '<div class="setrow head"><span>#</span><span>' + kg + '</span><span>' + (timeBased ? 'seg' : (repLabel || 'reps')) + '</span><span>RIR</span><span>tipo</span><span></span></div>';
 }
 function setRow(x, i, mode, timeBased) {
   const v = (n) => (n == null ? '' : fmt(n));
@@ -735,7 +813,7 @@ function blockHtml(rex, sets, key, s, exFallback) {
   } else h += '<p class="presc">Ejercicio extra (sin prescripción)</p>';
   const last = lastSessionSets(exId, s ? s.session_id : null);
   if (last) h += '<p class="lastline">Última vez (' + fmtDate(last.date) + '): ' + esc(last.sets.map((x) => setTxt(x, mode)).join(', ')) + '</p>';
-  h += '<div class="setgrid">' + (sets.length ? setHead(mode, timeBased) + sets.map((x, i) => setRow(x, i, mode, timeBased)).join('') : '') + '</div>';
+  h += '<div class="setgrid">' + (sets.length ? setHead(mode, timeBased, rex && rex.unit === 'm' ? 'metros' : 'reps') + sets.map((x, i) => setRow(x, i, mode, timeBased)).join('') : '') + '</div>';
   h += '<button class="btn sm" data-act="add-set" data-rex="' + esc(rex ? rex.rex_id : '') + '" data-ex="' + esc(exId) + '">+ Serie</button>';
   if (!rex && !sets.length) h += ' <button class="btn sm ghost" data-act="rm-extra" data-ex="' + esc(exId) + '">Quitar</button>';
   return h + '</div>';
@@ -950,8 +1028,9 @@ function modalHtml(m) {
   }
   if (m.type === 'import') {
     let h = '<h3>Importar bloque</h3><label class="field">Pegá el bloque que te dio Claude<textarea id="f-import" rows="8" placeholder=\'{"format":"streetlifting-block-v1","tables":{…}}\'>' + esc(m.text || '') + '</textarea></label>';
-    if (m.parsed && m.parsed.error) h += '<p class="msg err">' + esc(m.parsed.error) + '</p>';
-    if (m.parsed && !m.parsed.error) h += '<p class="msg">Listo para importar: ' + Object.entries(m.parsed.counts).map(([k, v]) => v + ' ' + k).join(', ') + '. Si trae una rutina activa nueva, la actual pasa a "completada".</p>';
+    if (m.parsed && m.parsed.error) { const list = [].concat(m.parsed.error); h += '<p class="msg err">El bloque no se importó. Problemas encontrados:</p><ul class="msglist err">' + list.slice(0, 12).map((x) => '<li>' + esc(x) + '</li>').join('') + (list.length > 12 ? '<li>…y ' + (list.length - 12) + ' más.</li>' : '') + '</ul><p class="msg">Pegale estos errores al chat de entrenamiento junto con el resumen de la app (trae el formato correcto) para que lo corrija.</p>'; }
+    if (m.parsed && !m.parsed.error) h += '<p class="msg">Listo para importar: ' + Object.entries(m.parsed.counts).map(([k, v]) => v + ' ' + k).join(', ') + '. La rutina activa actual pasa a "completada"; tu historial no se toca.</p>';
+    if (m.parsed && m.parsed.warnings && m.parsed.warnings.length) h += '<ul class="msglist">' + m.parsed.warnings.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>';
     return h + '<div class="sheetbtns"><button class="btn ghost" data-act="close-modal">Cancelar</button>' +
       (m.parsed && !m.parsed.error ? '<button class="btn primary" data-act="import-apply">Importar</button>' : '<button class="btn primary" data-act="import-check">Revisar</button>') + '</div>';
   }

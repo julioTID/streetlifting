@@ -674,8 +674,22 @@ function parseImport(text) {
   });
   if ((out.ROUTINES || []).length && !(out.ROUTINES || []).some((r) => r.status === 'active')) warnings.push('Ninguna rutina viene como "active": se importa, pero no se va a mostrar.');
   if (errors.length) return { error: errors, warnings };
+  /* Bloque completo de una rutina que ya existe (fila de ROUTINES + sus días): lo que no venga en el bloque se quita.
+     Se marca con deleted_at (nunca se borra), así el historial registrado sobre esas filas se conserva. */
+  const removals = { days: [], rex: [] };
+  (out.ROUTINES || []).forEach((rt) => {
+    if (!db.tables.ROUTINES[rt.routine_id]) return;
+    const blockDays = (out.ROUTINE_DAYS || []).filter((d) => d.routine_id === rt.routine_id);
+    if (!blockDays.length) return;
+    const keepDays = new Set(blockDays.map((d) => d.day_id));
+    const keepRex = new Set((out.ROUTINE_EXERCISES || []).map((r) => r.rex_id));
+    const days = rows('ROUTINE_DAYS').filter((d) => d.routine_id === rt.routine_id);
+    const dayIds = new Set(days.map((d) => d.day_id));
+    days.forEach((d) => { if (!keepDays.has(d.day_id)) removals.days.push(d.day_id); });
+    rows(REX).forEach((r) => { if (dayIds.has(r.day_id) && !keepRex.has(r.rex_id)) removals.rex.push(r.rex_id); });
+  });
   const counts = {}; for (const t in out) counts[t] = out[t].length;
-  return { tables: out, counts, warnings };
+  return { tables: out, counts, warnings, removals };
 }
 function applyImport(p) {
   const newActive = (p.tables.ROUTINES || []).filter((r) => r.status === 'active').map((r) => r.routine_id);
@@ -686,6 +700,7 @@ function applyImport(p) {
     put(t, c);
   }));
   if (newActive.length) rows('ROUTINES').forEach((r) => { if (r.status === 'active' && newActive.indexOf(r.routine_id) === -1) put('ROUTINES', { routine_id: r.routine_id, status: 'completed' }); });
+  if (p.removals) { p.removals.rex.forEach((id) => softDelete(REX, id)); p.removals.days.forEach((id) => softDelete('ROUTINE_DAYS', id)); }
   ui.week = null; ui.editWeek = null;
   changed(true);
 }
@@ -716,6 +731,7 @@ function buildSummary() {
   });
   L.push(''); L.push('FORMATO PARA IMPORTAR EL PRÓXIMO BLOQUE EN LA APP');
   L.push('JSON: {"format":"streetlifting-block-v1","tables":{...}}. IDs nuevos y únicos en cada bloque (ej. rtn_b3, day_b3_1, rex_b3_d1_01_w1); nunca reutilizar IDs de bloques anteriores.');
+  L.push('Para MODIFICAR la rutina activa: mandá la rutina completa con los mismos IDs (su fila de ROUTINES + todos sus días + todas sus prescripciones). Lo que no venga en el bloque se quita solo (sin borrar historial). Si mandás solo algunas filas sin los días, se actualizan esas y no se quita nada.');
   L.push('ROUTINES: routine_id, name, weeks (entero), week_labels ("A|B|C|D"), status ("active"), start_date (YYYY-MM-DD), notes');
   L.push('ROUTINE_DAYS: day_id, routine_id, day_index (entero), name, type (heavy|tech|rest), cue (indicación técnica)');
   L.push('ROUTINE_EXERCISES: rex_id, day_id, exercise_id, week_from, week_to, position, role (' + codesOf(ROLES).join('|') + '), sets, reps (texto: "5" o "8-10"), unit (reps|s|m), load_type (pct|kg|added_kg|bodyweight|null), load_value, pct_of (solo con pct: ' + rows('PROFILE').map((p) => p.key).filter((k) => k.indexOf('ref_max.') === 0).map((k) => k.slice(8)).join('|') + '), rir (texto), rest_sec, notes');
@@ -1030,6 +1046,14 @@ function modalHtml(m) {
     let h = '<h3>Importar bloque</h3><label class="field">Pegá el bloque que te dio Claude<textarea id="f-import" rows="8" placeholder=\'{"format":"streetlifting-block-v1","tables":{…}}\'>' + esc(m.text || '') + '</textarea></label>';
     if (m.parsed && m.parsed.error) { const list = [].concat(m.parsed.error); h += '<p class="msg err">El bloque no se importó. Problemas encontrados:</p><ul class="msglist err">' + list.slice(0, 12).map((x) => '<li>' + esc(x) + '</li>').join('') + (list.length > 12 ? '<li>…y ' + (list.length - 12) + ' más.</li>' : '') + '</ul><p class="msg">Pegale estos errores al chat de entrenamiento junto con el resumen de la app (trae el formato correcto) para que lo corrija.</p>'; }
     if (m.parsed && !m.parsed.error) h += '<p class="msg">Listo para importar: ' + Object.entries(m.parsed.counts).map(([k, v]) => v + ' ' + k).join(', ') + '. La rutina activa actual pasa a "completada"; tu historial no se toca.</p>';
+    if (m.parsed && m.parsed.removals && (m.parsed.removals.days.length || m.parsed.removals.rex.length)) {
+      const rm = m.parsed.removals; const dayName = (id) => { const d = db.tables.ROUTINE_DAYS[id]; return d ? 'Día ' + d.day_index + ' — ' + d.name : id; };
+      const items = rm.days.map((id) => 'Día completo: ' + dayName(id)).concat(rm.rex.filter((id) => rm.days.indexOf((db.tables[REX][id] || {}).day_id) === -1).map((id) => {
+        const r = db.tables[REX][id]; const d = db.tables.ROUTINE_DAYS[r.day_id];
+        return exName(r.exercise_id) + ' (día ' + (d ? d.day_index : '?') + (r.week_from === r.week_to ? ', semana ' + r.week_from : '') + ')';
+      }));
+      h += '<p class="msg">Ya no están en el bloque y se van a quitar de la rutina (el historial que registraste se conserva):</p><ul class="msglist">' + items.slice(0, 15).map((x) => '<li>' + esc(x) + '</li>').join('') + (items.length > 15 ? '<li>…y ' + (items.length - 15) + ' más.</li>' : '') + '</ul>';
+    }
     if (m.parsed && m.parsed.warnings && m.parsed.warnings.length) h += '<ul class="msglist">' + m.parsed.warnings.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>';
     return h + '<div class="sheetbtns"><button class="btn ghost" data-act="close-modal">Cancelar</button>' +
       (m.parsed && !m.parsed.error ? '<button class="btn primary" data-act="import-apply">Importar</button>' : '<button class="btn primary" data-act="import-check">Revisar</button>') + '</div>';

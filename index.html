@@ -60,7 +60,8 @@
   .totalunit{ font-size:20px; color:var(--text-muted); }
   .totallabel{ margin:6px 0 20px; font-size:13px; color:var(--text-muted); }
 
-  .maxgrid{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .maxgrid{ display:grid; grid-template-columns:repeat(4,1fr); gap:8px; }
+  .maxgrid input.zero{ border-color:var(--gold); color:var(--gold); }
   .maxgrid label{ display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--text-muted); }
   .maxgrid input{
     font:600 20px/1 "Barlow Condensed",sans-serif; color:var(--text);
@@ -229,7 +230,8 @@
 const PK = { PROFILE:'key', EXERCISES:'exercise_id', ROUTINES:'routine_id', ROUTINE_DAYS:'day_id',
   ROUTINE_EXERCISES:'rex_id', SESSIONS:'session_id', SETS:'set_id', BODY_METRICS:'metric_id', GOALS:'goal_id' };
 const REX = 'ROUTINE_EXERCISES';
-const MAIN_LIFTS = [['back_squat','Sentadilla'], ['weighted_pullup','Dominada +'], ['weighted_dip','Fondo +']];
+const MAIN_LIFTS = [['back_squat','Sentadilla', null], ['weighted_pullup','Dominada +', null], ['weighted_dip','Fondo +', null], ['muscle_up','Muscle up +', 0]];
+function mainMax(id) { const v = refMax(id); if (v != null) return v; const m = MAIN_LIFTS.find((x) => x[0] === id); return m ? m[2] : null; }
 const DAYTYPE_LABEL = { heavy:'Pesado', tech:'Técnica', rest:'Descanso' };
 const ROLES = [['main','Principal'], ['accessory','Accesorio'], ['technique','Técnica'], ['mobility','Movilidad'], ['skill','Skill']];
 const EX_TYPES = [['main','Principal'], ['variant','Variante'], ['accessory','Accesorio'], ['technique','Técnica'], ['mobility','Movilidad'], ['skill','Skill']];
@@ -622,7 +624,7 @@ function buildSummary() {
   const L = []; const bw = bodyweight();
   L.push('RESUMEN STREETLIFTING — ' + todayLocal());
   L.push('Peso corporal: ' + (bw != null ? fmt(bw) + ' kg' : 'sin dato'));
-  L.push('Máximos de referencia: ' + MAIN_LIFTS.map(([id]) => exName(id) + ' ' + (refMax(id) != null ? (isAdded(id) ? '+' : '') + fmt(refMax(id)) + ' kg' : '—')).join(' | '));
+  L.push('Máximos de referencia: ' + MAIN_LIFTS.map(([id]) => exName(id) + ' ' + (mainMax(id) != null ? (isAdded(id) ? '+' : '') + fmt(mainMax(id)) + ' kg' : '—')).join(' | '));
   const rt = activeRoutine(); if (rt) L.push('Bloque activo: ' + rt.name + ' (semana ' + currentWeek(rt) + ' de ' + (rt.weeks || 4) + ')');
   const since = minusDays(todayLocal(), 56);
   const sess = rows('SESSIONS').filter((s) => (s.date || '') >= since).sort((a, b) => (a.date || '').localeCompare(b.date || '') || (a.created_at || '').localeCompare(b.created_at || ''));
@@ -657,7 +659,7 @@ function topbar() {
 function backbar(target) { return '<div class="topbar"><button class="back" data-act="go" data-view="' + target + '">← Volver</button><div class="topnav">' + pillHtml() + '</div></div>'; }
 
 function hero() {
-  const total = MAIN_LIFTS.reduce((s, [id]) => s + (refMax(id) || 0), 0);
+  const total = MAIN_LIFTS.reduce((s, [id]) => s + (mainMax(id) || 0), 0);
   const h = num(profile('height_cm')); const bw = bodyweight(); const arm = profile('arm_length_cm'); const anth = profile('anthropometry');
   const bits = [];
   if (h != null) bits.push((h / 100).toFixed(2) + ' m');
@@ -666,10 +668,10 @@ function hero() {
   if (anth) bits.push(esc(String(anth).toLowerCase()));
   return '<header class="hero"><p class="eyebrow">' + esc(activeRoutine() ? activeRoutine().name : 'Bloque de fuerza') + ' · ' + ((activeRoutine() && activeRoutine().weeks) || 4) + (((activeRoutine() && activeRoutine().weeks) || 4) === 1 ? ' semana' : ' semanas') + '</p>' +
     '<h1 class="total display"><span class="totalnum">' + fmt(total) + '</span><span class="totalunit">kg</span></h1>' +
-    '<p class="totallabel">Total estimado — sentadilla + dominada lastrada + fondo lastrado</p><div class="maxgrid">' +
-    MAIN_LIFTS.map(([id, l]) => '<label>' + l + '<input type="number" step="0.5" inputmode="decimal" data-max="' + id + '" value="' + fmt(refMax(id)) + '"></label>').join('') +
+    '<p class="totallabel">Total estimado — sentadilla + dominada lastrada + fondo lastrado + muscle up lastrado</p><div class="maxgrid">' +
+    MAIN_LIFTS.map(([id, l]) => { const v = mainMax(id); return '<label>' + l + '<input type="number" step="0.5" inputmode="decimal" data-max="' + id + '" value="' + (v == null ? '' : fmt(v)) + '"' + (v === 0 ? ' class="zero"' : '') + '></label>'; }).join('') +
     '</div><p class="bodystats">' + bits.join(' · ') + '</p>' +
-    '<p class="footnote">Máximos de referencia estimados con Epley. En dominadas y fondos el porcentaje se calcula sobre peso corporal + lastre. Editalos cuando tengas una marca real o retestees en la semana 4.</p></header>';
+    '<p class="footnote">Máximos de referencia estimados con Epley. En dominadas, fondos y muscle up el porcentaje se calcula sobre peso corporal + lastre. Editalos cuando tengas una marca real o retestees en la semana 4.</p></header>';
 }
 function rexLine(r, date) {
   const cls = r.role === 'main' ? 'main' : r.role === 'skill' ? 'mu' : (r.role === 'technique' || r.role === 'mobility') ? 'extra' : '';
@@ -964,7 +966,14 @@ function modalHtml(m) {
   }
   return '';
 }
+let modalRendering = false, modalAgain = false;
 function renderModal() {
+  if (modalRendering) { modalAgain = true; return; }
+  modalRendering = true;
+  try { renderModalNow(); } finally { modalRendering = false; }
+  if (modalAgain) { modalAgain = false; renderModal(); }
+}
+function renderModalNow() {
   const root = document.getElementById('modal-root');
   root.innerHTML = ui.modal ? '<div class="modal" data-overlay="1"><div class="sheet" role="dialog" aria-modal="true">' + modalHtml(ui.modal) + '</div></div>' : '';
 }
@@ -972,8 +981,15 @@ function openModal(m) { ui.modal = m; renderModal(); }
 function closeModal() { ui.modal = null; renderModal(); }
 
 /* ============================ RENDER ============================ */
-let lastRenderedView = null;
+let lastRenderedView = null, rendering = false, renderAgain = false;
+/* Evita renders anidados: al reemplazar un campo con foco, el navegador puede disparar blur/change en medio del reemplazo. */
 function render() {
+  if (rendering) { renderAgain = true; return; }
+  rendering = true;
+  try { renderNow(); } finally { rendering = false; }
+  if (renderAgain) { renderAgain = false; render(); }
+}
+function renderNow() {
   const app = document.getElementById('app');
   const sameView = lastRenderedView === ui.view; const y = window.scrollY;
   let html;

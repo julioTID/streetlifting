@@ -632,7 +632,8 @@ function parseImport(text) {
   if (errors.length) return { error: errors, warnings };
   const inBlock = (t) => new Map((out[t] || []).map((r) => [r[PK[t]], r]));
   const EXb = inBlock('EXERCISES'), RTb = inBlock('ROUTINES'), DYb = inBlock('ROUTINE_DAYS');
-  const byName = {}; rows('EXERCISES').forEach((e) => { byName[normName(e.name)] = e.exercise_id; });
+  const junk = new Set(planRepair().exercises.map((e) => e.exercise_id));
+  const byName = {}; rows('EXERCISES').forEach((e) => { if (!junk.has(e.exercise_id)) byName[normName(e.name)] = e.exercise_id; });
   (out.EXERCISES || []).forEach((e) => {
     const cur = db.tables.EXERCISES[e.exercise_id]; const tag = 'Ejercicio ' + e.exercise_id + ': ';
     if (!cur) {
@@ -662,6 +663,7 @@ function parseImport(text) {
     const day = DYb.get(r.day_id) || db.tables.ROUTINE_DAYS[r.day_id];
     if (!day) E(tag + 'el día ' + r.day_id + ' no existe.');
     if (!EXb.has(r.exercise_id) && !db.tables.EXERCISES[r.exercise_id]) E(tag + 'el ejercicio ' + r.exercise_id + ' no existe en la biblioteca ni en el bloque.');
+    else if (!EXb.has(r.exercise_id) && codesOf(LOAD_MODES).indexOf(db.tables.EXERCISES[r.exercise_id].load_mode) === -1) E(tag + 'el ejercicio ' + r.exercise_id + ' está incompleto (sin load_mode). Usá el ID correcto de la biblioteca.');
     if (r.load_type != null && codesOf(LOAD_TYPES).concat(['']).indexOf(r.load_type) === -1) E(tag + 'load_type "' + r.load_type + '" no válido (pct, kg, added_kg, bodyweight o null).');
     if (r.load_type === 'pct') {
       if (r.load_value == null) E(tag + 'falta load_value (el porcentaje).');
@@ -691,18 +693,72 @@ function parseImport(text) {
   const counts = {}; for (const t in out) counts[t] = out[t].length;
   return { tables: out, counts, warnings, removals };
 }
+
+/* ---------- Revisión automática de datos: ordena lo suelto sin tocar el Sheet a mano ----------
+   Reglas conservadoras: solo marca con deleted_at (nunca borra), y nunca toca series ni sesiones. */
+const VALID_STATUS = ['active', 'completed', 'draft'];
+function planRepair() {
+  const R = db.tables.ROUTINES, D = db.tables.ROUTINE_DAYS, EX = db.tables.EXERCISES;
+  const plan = { routines: [], days: [], rex: [], exercises: [], complete: [], notes: [] };
+  const delR = new Set(), delD = new Set(), delX = new Set();
+  rows('ROUTINES').forEach((r) => { if (VALID_STATUS.indexOf(r.status) === -1) { delR.add(r.routine_id); plan.routines.push(r); } });
+  rows('ROUTINE_DAYS').forEach((d) => { if (!alive(R[d.routine_id]) || delR.has(d.routine_id)) { delD.add(d.day_id); plan.days.push(d); } });
+  rows(REX).forEach((x) => { if (!alive(D[x.day_id]) || delD.has(x.day_id) || !EX[x.exercise_id]) { delX.add(x.rex_id); plan.rex.push(x); } });
+  rows('ROUTINES').filter((r) => r.status === 'active' && !delR.has(r.routine_id))
+    .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || '')).slice(1).forEach((r) => plan.complete.push(r));
+  const withSets = new Set(rows('SETS').map((x) => x.exercise_id));
+  const referenced = new Set();
+  rows(REX).forEach((x) => { if (!delX.has(x.rex_id)) { referenced.add(x.exercise_id); if (x.pct_of) referenced.add(x.pct_of); } });
+  rows('PROFILE').forEach((p) => { if (String(p.key).indexOf('ref_max.') === 0) referenced.add(p.key.slice(8)); });
+  const used = (e) => withSets.has(e.exercise_id) || referenced.has(e.exercise_id);
+  const validMode = (e) => codesOf(LOAD_MODES).indexOf(e.load_mode) !== -1;
+  const live = rows('EXERCISES'); const archive = new Set();
+  live.forEach((e) => { if (!used(e) && !validMode(e)) archive.add(e.exercise_id); });
+  const byName = {}; live.forEach((e) => { if (!archive.has(e.exercise_id)) (byName[normName(e.name)] = byName[normName(e.name)] || []).push(e); });
+  Object.values(byName).forEach((list) => {
+    if (list.length < 2) return;
+    const keep = list.filter(used);
+    if (keep.length) list.forEach((e) => { if (!used(e)) archive.add(e.exercise_id); });
+    else plan.notes.push('"' + list[0].name + '" está repetido (' + list.map((e) => e.exercise_id).join(', ') + ') y ninguno tiene historial. Podés archivar uno desde Ejercicios.');
+    if (keep.length > 1) plan.notes.push('"' + list[0].name + '" tiene historial en más de un ID (' + keep.map((e) => e.exercise_id).join(', ') + '). No se toca: avisale a Claude en el chat de desarrollo.');
+  });
+  plan.exercises = live.filter((e) => archive.has(e.exercise_id));
+  const S = db.tables.SESSIONS;
+  const orphanSets = rows('SETS').filter((x) => !S[x.session_id] || !EX[x.exercise_id]).length;
+  if (orphanSets) plan.notes.push(orphanSets + ' series apuntan a una sesión o ejercicio que no existe. No se tocan porque son historial.');
+  plan.count = plan.routines.length + plan.days.length + plan.rex.length + plan.exercises.length + plan.complete.length;
+  return plan;
+}
+function applyRepair(plan) {
+  plan.rex.forEach((x) => softDelete(REX, x.rex_id));
+  plan.days.forEach((d) => softDelete('ROUTINE_DAYS', d.day_id));
+  plan.routines.forEach((r) => softDelete('ROUTINES', r.routine_id));
+  plan.exercises.forEach((e) => softDelete('EXERCISES', e.exercise_id));
+  plan.complete.forEach((r) => put('ROUTINES', { routine_id: r.routine_id, status: 'completed' }));
+}
+function repairItems(plan) {
+  const L = [];
+  if (plan.routines.length) L.push(plan.routines.length + ' rutina(s) mal importada(s): ' + plan.routines.map((r) => r.name || r.routine_id).join(', '));
+  if (plan.days.length) L.push(plan.days.length + ' día(s) de rutinas que ya no existen');
+  if (plan.rex.length) L.push(plan.rex.length + ' prescripción(es) sueltas (sin día o sin ejercicio)');
+  if (plan.exercises.length) L.push(plan.exercises.length + ' ejercicio(s) duplicados o incompletos sin historial: ' + plan.exercises.map((e) => e.name || e.exercise_id).join(', '));
+  if (plan.complete.length) L.push('Había más de una rutina activa: ' + plan.complete.map((r) => r.name).join(', ') + ' pasa(n) a completada(s)');
+  return L;
+}
 function applyImport(p) {
   const newActive = (p.tables.ROUTINES || []).filter((r) => r.status === 'active').map((r) => r.routine_id);
   IMPORTABLE.forEach((t) => (p.tables[t] || []).forEach((r) => {
-    const c = stripMeta(r);
+    const c = stripMeta(r); c.deleted_at = null;
     if (t === REX) { if (c.reps != null) c.reps = String(c.reps); if (c.rir != null) c.rir = String(c.rir); }
     if (t === 'PROFILE' && c.value != null) c.value = String(c.value);
     put(t, c);
   }));
   if (newActive.length) rows('ROUTINES').forEach((r) => { if (r.status === 'active' && newActive.indexOf(r.routine_id) === -1) put('ROUTINES', { routine_id: r.routine_id, status: 'completed' }); });
   if (p.removals) { p.removals.rex.forEach((id) => softDelete(REX, id)); p.removals.days.forEach((id) => softDelete('ROUTINE_DAYS', id)); }
+  const plan = planRepair(); applyRepair(plan);
   ui.week = null; ui.editWeek = null;
   changed(true);
+  return plan;
 }
 function buildSummary() {
   const L = []; const bw = bodyweight();
@@ -937,7 +993,7 @@ function viewLibrary() {
   let h = backbar('home') + '<h2 class="vtitle">Ejercicios</h2><p class="vsub">El historial pertenece a cada ejercicio, aunque cambie la rutina. Tocá uno para ver su evolución.</p>' +
     '<button class="btn primary" data-act="newex">+ Nuevo ejercicio</button>';
   Object.keys(cats).sort((a, b) => a.localeCompare(b, 'es')).forEach((c) => { h += '<div class="libgroup"><h4>' + esc(c) + '</h4>' + cats[c].map(item).join('') + '</div>'; });
-  const archived = all.filter((e) => e.deleted_at);
+  const archived = all.filter((e) => e.deleted_at && count[e.exercise_id]);
   if (archived.length) h += '<div class="libgroup"><h4>Archivados</h4>' + archived.map(item).join('') + '</div>';
   return h;
 }
@@ -974,6 +1030,7 @@ function viewSettings() {
       '<br>Última sincronización: ' + (db.meta.lastSyncAt || db.meta.lastPullAt ? new Date(db.meta.lastSyncAt > (db.meta.lastPullAt || '') ? db.meta.lastSyncAt : db.meta.lastPullAt).toLocaleString('es-AR') : 'nunca') +
       (syncState.lastError ? '<br>Último error: ' + esc(syncState.lastError) : '') + '</p><button class="btn block" data-act="syncnow">Sincronizar ahora</button></div>' +
       '<div class="panel"><h3>Claude</h3><p class="note">Copiá tu historial reciente para pegarlo en el chat y que Claude evalúe tu evolución o arme el próximo bloque.</p><button class="btn block" data-act="export">Copiar resumen para Claude</button></div>' +
+      '<div class="panel"><h3>Revisar datos</h3><p class="note">Busca datos sueltos (importaciones fallidas, duplicados) y los ordena desde la app. Nunca hace falta editar el Sheet a mano.</p><button class="btn block" data-act="check-data">Revisar datos</button></div>' +
       '<div class="panel"><h3>Respaldo</h3><p class="note">Tu fuente permanente es el Google Sheet. Esto descarga además una copia local en JSON.</p><button class="btn block" data-act="backup">Descargar respaldo</button></div>';
   }
   return h;
@@ -1061,6 +1118,15 @@ function modalHtml(m) {
   if (m.type === 'export') {
     return '<h3>Resumen para Claude</h3><p class="msg" style="margin-top:0">' + (m.copied ? 'Copiado. Pegalo en el chat con Claude.' : 'Seleccioná y copiá el texto.') + '</p><pre class="summary">' + esc(m.text) + '</pre>' +
       '<div class="sheetbtns"><button class="btn" data-act="copy-summary">Copiar</button><button class="btn primary" data-act="close-modal">Listo</button></div>';
+  }
+  if (m.type === 'imported' || m.type === 'repair') {
+    const items = repairItems(m.plan);
+    let h = '<h3>' + (m.type === 'imported' ? 'Bloque importado' : (m.done ? 'Datos ordenados' : 'Revisión de datos')) + '</h3>';
+    if (m.type === 'imported') h += '<p class="msg" style="margin-top:0">La rutina nueva ya está activa. Tu historial no se tocó.</p>';
+    if (items.length) h += '<p class="msg">' + (m.type === 'repair' && !m.done ? 'Se encontraron datos sueltos. Se pueden ordenar automáticamente (se marcan como quitados, no se borra nada y no se toca tu historial):' : 'Además se ordenaron automáticamente:') + '</p><ul class="msglist">' + items.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>';
+    else if (m.type === 'repair') h += '<p class="msg" style="margin-top:0">Todo en orden: no hay datos sueltos.</p>';
+    if (m.plan.notes.length) h += '<p class="msg">Para tu información:</p><ul class="msglist">' + m.plan.notes.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>';
+    return h + '<div class="sheetbtns">' + (m.type === 'repair' && !m.done && items.length ? '<button class="btn ghost" data-act="close-modal">Ahora no</button><button class="btn primary" data-act="apply-repair">Ordenar</button>' : '<button class="btn primary" data-act="close-modal">Listo</button>') + '</div>';
   }
   if (m.type === 'syncinfo') {
     return '<h3>' + SYNC_LABEL[syncState.state] + '</h3><p class="msg" style="margin-top:0">Cambios pendientes: ' + pendingCount() +
@@ -1196,7 +1262,9 @@ document.addEventListener('click', async (e) => {
     }
     case 'import': openModal({ type: 'import' }); break;
     case 'import-check': { const text = val('f-import'); openModal({ type: 'import', text, parsed: parseImport(text) }); break; }
-    case 'import-apply': applyImport(ui.modal.parsed); closeModal(); go('home'); break;
+    case 'import-apply': { const plan = applyImport(ui.modal.parsed); go('home'); openModal({ type: 'imported', plan }); break; }
+    case 'check-data': openModal({ type: 'repair', plan: planRepair() }); break;
+    case 'apply-repair': { applyRepair(ui.modal.plan); changed(true); const after = planRepair(); openModal({ type: 'repair', plan: after, done: true }); render(); break; }
     case 'export': {
       const text = buildSummary(); let copied = false;
       try { await navigator.clipboard.writeText(text); copied = true; } catch (err) { copied = false; }

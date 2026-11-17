@@ -170,6 +170,15 @@
     padding:8px 6px; width:100%; min-width:0; }
   .setrow select{ font-size:14px; padding:8px 2px; }
   .field textarea{ resize:vertical; }
+  .setrow.cl{ grid-template-columns:18px .85fr 1.5fr .6fr 1.3fr 30px; }
+  .setsub{ display:flex; flex-wrap:wrap; align-items:center; gap:6px 10px; padding:0 0 4px 24px; font-size:12px; color:var(--text-muted); }
+  .setsub input{ width:58px; font:500 15px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:var(--text);
+    background:var(--surface-2); border:1px solid var(--line); border-radius:3px; padding:6px; }
+  .setsub b{ color:var(--text); font-weight:600; }
+  input.bad{ border-color:var(--iron) !important; outline:1px solid var(--iron); }
+  .warnbar{ margin:0 0 14px; padding:10px 12px; border:1px solid var(--gold); border-radius:3px; font-size:12px; line-height:1.5; color:var(--text); }
+  .boline{ margin:10px 0 0; padding:10px 12px; background:var(--surface-2); border-radius:3px; font-size:13px; line-height:1.6; color:var(--text-muted); }
+  .boline b{ font:600 24px/1.1 "Barlow Condensed",sans-serif; color:var(--text); }
   .xbtn{ width:30px; height:34px; border:1px solid var(--line); background:var(--surface-2); color:var(--text-muted);
     border-radius:3px; cursor:pointer; font-size:14px; padding:0; }
   .xbtn:disabled{ opacity:.3; cursor:default; }
@@ -241,8 +250,13 @@ const DAYTYPE_LABEL = { heavy:'Pesado', tech:'Técnica', rest:'Descanso' };
 const ROLES = [['main','Principal'], ['secondary','Secundario'], ['accessory','Accesorio'], ['technique','Técnica'], ['mobility','Movilidad'], ['skill','Skill']];
 const EX_TYPES = [['main','Principal'], ['variant','Variante'], ['accessory','Accesorio'], ['technique','Técnica'], ['mobility','Movilidad'], ['skill','Skill']];
 const LOAD_MODES = [['barbell','Barra (peso total)'], ['added_weight','Lastre (peso corporal + kg)'], ['external','Carga externa'], ['bodyweight','Peso corporal'], ['time','Por tiempo']];
-const LOAD_TYPES = [['','Sin carga fija'], ['pct','% del máximo'], ['kg','kg'], ['added_kg','Lastre (kg)'], ['bodyweight','Peso corporal']];
-const SET_TYPES = [['working','Efectiva'], ['warmup','Aprox.'], ['top','Top'], ['backoff','Back-off'], ['amrap','AMRAP'], ['test','Test']];
+const LOAD_TYPES = [['','Sin carga fija'], ['pct','% del máximo'], ['kg','kg'], ['added_kg','Lastre (kg)'], ['bodyweight','Peso corporal'], ['backoff','Back-off (% menos que el top)']];
+const SET_TYPES = [['working','Efectiva'], ['warmup','Aprox.'], ['top','Top'], ['backoff','Back-off'], ['amrap','AMRAP'], ['test','Test'], ['emom','EMOM'], ['cluster','Cluster']];
+const CLUSTER_REST_SEC = 30;          // pausa fija entre mini-bloques de un cluster
+const E1RM_MAX_RIR = 3;               // el e1RM solo usa series con RIR 3 o menos
+const TOTAL_LOAD_IDS = new Set(['weighted_pullup', 'weighted_dip', 'muscle_up']);   // % y e1RM sobre carga total
+const V2_FIELDS = { SETS: ['minutes_planned', 'minutes_done', 'reps_detail'], ROUTINE_EXERCISES: ['format'] };
+const CLUSTER_RE = /^\d+(\+\d+)+$/;
 const SYNC_LABEL = { synced:'Sincronizado', syncing:'Sincronizando...', pending:'Cambios pendientes', error:'Error de sincronización' };
 
 let db = { tables:{}, outbox:{}, config:{ apiUrl:'', token:'' }, meta:{ lastSyncAt:null, lastPullAt:null } };
@@ -314,7 +328,40 @@ function profile(key) { const r = db.tables.PROFILE[key]; return alive(r) ? r.va
 function refMax(exId) { const v = num(profile('ref_max.' + exId)); return v; }
 function exercise(id) { return db.tables.EXERCISES[id] || null; }
 function exName(id) { const e = exercise(id); return e ? e.name : (id || '—'); }
+const round25 = (x) => Math.round(x / 2.5) * 2.5;
 function isAdded(exId) { const e = exercise(exId); return !!e && (e.load_mode === 'added_weight' || e.load_mode === 'bodyweight'); }
+/* Dominada, fondo, muscle up y cualquier ejercicio lastrado: la carga real es peso corporal + lastre. */
+function isTotalLoad(exId) { const e = exercise(exId); return TOTAL_LOAD_IDS.has(exId) || (!!e && e.load_mode === 'added_weight'); }
+function parseCluster(t) { const v = String(t == null ? '' : t).replace(/\s+/g, ''); return CLUSTER_RE.test(v) ? v.split('+').map(Number) : null; }
+const isClusterReps = (t) => !!parseCluster(t);
+function totalReps(x) {
+  if (x.set_type === 'cluster') { const c = parseCluster(x.reps_detail); return c ? c.reduce((a, b) => a + b, 0) : null; }
+  if (x.set_type === 'emom') return x.reps != null && x.minutes_done != null ? x.reps * x.minutes_done : null;
+  return x.reps;
+}
+/* Kilos movidos por repetición: peso corporal + lastre en ejercicios de carga total; el peso en barra/externos. */
+function repLoad(x, exId, date) {
+  const e = exercise(exId); if (!e || e.load_mode === 'time') return null;
+  if (isTotalLoad(exId)) { const bw = bodyweight(date); return bw == null ? null : bw + (x.weight_kg || 0); }
+  if (e.load_mode === 'bodyweight') return null;
+  return x.weight_kg != null ? x.weight_kg : null;
+}
+/* Tonelaje. EMOM: minutos completados × reps por minuto × (peso corporal + lastre). */
+function tonnage(x, exId, date) { if (x.set_type === 'warmup') return null; const L = repLoad(x, exId, date); const r = totalReps(x); return L == null || r == null ? null : L * r; }
+/* Top set de un ejercicio en una sesión: el marcado "Top"; si no hay, la serie más pesada. */
+function topSetFor(sessionId, exId) {
+  if (!sessionId) return null;
+  const list = setsOf(sessionId).filter((x) => x.exercise_id === exId && ['warmup', 'backoff', 'emom'].indexOf(x.set_type) === -1);
+  const tops = list.filter((x) => x.set_type === 'top');
+  const pool = tops.length ? tops : list.filter((x) => x.weight_kg != null);
+  return pool.reduce((b, x) => (!b || (x.weight_kg || 0) > (b.weight_kg || 0) ? x : b), null);
+}
+/* Back-off = (peso corporal + lastre top) × (1 − %) − peso corporal. En barra: top × (1 − %). */
+function backoffCalc(topKg, pct, exId, bw) {
+  const p = pct / 100;
+  if (isAdded(exId)) { if (bw == null) return null; const exact = (bw + (topKg || 0)) * (1 - p) - bw; return { exact, kg: Math.max(0, round25(exact)), added: true, total: (bw + (topKg || 0)) * (1 - p) }; }
+  const exact = (topKg || 0) * (1 - p); return { exact, kg: round25(exact), added: false, total: exact };
+}
 
 function put(table, patch) {
   const pk = PK[table]; const id = patch[pk];
@@ -412,8 +459,7 @@ function sessionFor(dayId, w) { return rows('SESSIONS').filter((s) => s.day_id =
 function setsOf(sid) { return rows('SETS').filter((s) => s.session_id === sid).sort((a, b) => (a.created_at || '').localeCompare(b.created_at || '')); }
 
 /* ---------- Cálculo de cargas (nada de esto se guarda) ---------- */
-const round25 = (x) => Math.round(x / 2.5) * 2.5;
-function prescribedLoad(r, date) {
+function prescribedLoad(r, date, ctx) {
   const lt = r.load_type;
   if (lt === 'pct') {
     const max = refMax(r.pct_of || r.exercise_id);
@@ -430,51 +476,74 @@ function prescribedLoad(r, date) {
   if (lt === 'kg' && r.load_value != null) return { kg: r.load_value, text: fmt(r.load_value) + ' kg' };
   if (lt === 'added_kg' && r.load_value != null) return { kg: r.load_value, added: true, text: '+' + fmt(r.load_value) + ' kg' };
   if (lt === 'bodyweight') return { kg: 0, added: true, text: null };
+  if (lt === 'backoff' && r.load_value != null) {
+    const note = '−' + fmt(r.load_value) + '% del top';
+    const exId = (ctx && ctx.exId) || r.exercise_id;
+    const top = ctx ? topSetFor(ctx.sessionId, exId) : null;
+    if (!top) return { text: null, note: note + ' set' };
+    const c = backoffCalc(top.weight_kg, r.load_value, exId, bodyweight(date));
+    if (!c) return { text: null, note: note + ' set' };
+    return { kg: c.kg, added: c.added, text: (c.added ? '+' : '') + fmt(c.kg) + ' kg', note };
+  }
   return null;
 }
 function specText(r) {
+  if (r.format === 'emom') return 'EMOM ' + (r.sets != null ? r.sets + ' min' : '') + (r.reps != null && r.reps !== '' ? ' × ' + r.reps + ' rep' + (String(r.reps) === '1' ? '' : 's') + '/min' : '');
+  if (isClusterReps(r.reps)) return (r.sets != null ? r.sets + '×' : '') + '(' + parseCluster(r.reps).join('+') + ')';
   if (r.sets != null && r.reps != null && r.reps !== '') return r.sets + '×' + r.reps + (r.unit === 's' ? ' s' : r.unit === 'm' ? ' m' : '');
   if (r.sets != null) return r.sets + ' series';
   return '';
 }
 function restTxt(sec) { return sec >= 60 ? (Math.round(sec / 6) / 10) + ' min' : sec + ' s'; }
-function specHtml(r, date) {
-  const st = specText(r); const ld = prescribedLoad(r, date);
+function specHtml(r, date, ctx) {
+  const st = specText(r); const ld = prescribedLoad(r, date, ctx);
   let s = esc(st);
   if (ld && ld.text) { s += (st ? ' @ ' : '') + '<b>' + esc(ld.text) + '</b>'; if (ld.pct != null) s += ' <span class="pct">(' + fmt(ld.pct) + '%)</span>'; }
+  if (ld && ld.note) s += (ld.text ? ' ' : (st ? ' @ ' : '')) + '<span class="pct">(' + esc(ld.note) + ')</span>';
   const extra = [];
+  if (isClusterReps(r.reps)) extra.push('pausa ' + CLUSTER_REST_SEC + ' s entre mini-bloques');
   if (r.rir != null && r.rir !== '') extra.push('RIR ' + esc(r.rir));
   if (r.rest_sec) extra.push('descanso ' + restTxt(r.rest_sec));
   if (extra.length) s += (s ? '<br>' : '') + '<span class="pct">' + extra.join(' · ') + '</span>';
   return s;
 }
-function specPlain(r, date) {
-  const st = specText(r); const ld = prescribedLoad(r, date);
+function specPlain(r, date, ctx) {
+  const st = specText(r); const ld = prescribedLoad(r, date, ctx);
   let s = st; if (ld && ld.text) s += (st ? ' @ ' : '') + ld.text + (ld.pct != null ? ' (' + fmt(ld.pct) + '%)' : '');
+  if (ld && ld.note) s += ' (' + ld.note + ')';
+  if (isClusterReps(r.reps)) s += ', ' + CLUSTER_REST_SEC + ' s entre mini-bloques';
   if (r.rir != null && r.rir !== '') s += ' RIR ' + r.rir;
   return s || '—';
 }
 
 /* ---------- e1RM, PRs, historial (calculados) ---------- */
+/* e1RM (Epley con reps + RIR). Solo series con RIR anotado y ≤ 3. Cluster: último mini-bloque; EMOM: reps del último minuto.
+   Dominada, fondo y muscle up sobre carga total: (peso corporal + lastre) × factor − peso corporal. */
 function e1rm(x, exId, date) {
   const e = exercise(exId); if (!e) return null;
   const mode = e.load_mode;
-  if (mode === 'time' || mode === 'bodyweight') return null;
-  if (!x.reps || x.reps < 1) return null;
-  const n = x.reps + (x.rir || 0);
+  if (mode === 'time' || (mode === 'bodyweight' && !isTotalLoad(exId))) return null;
+  if (x.set_type === 'warmup' || x.rir == null || x.rir > E1RM_MAX_RIR) return null;
+  const c = x.set_type === 'cluster' ? parseCluster(x.reps_detail) : null;
+  const reps = x.set_type === 'cluster' ? (c ? c[c.length - 1] : null) : x.reps;
+  if (!reps || reps < 1) return null;
+  const n = reps + x.rir;
   if (n > 12) return null;
   const f = n === 1 ? 1 : 1 + n / 30;
-  if (mode === 'added_weight') { const bw = bodyweight(date); if (bw == null) return null; return (bw + (x.weight_kg || 0)) * f - bw; }
+  if (isTotalLoad(exId)) { const bw = bodyweight(date); if (bw == null) return null; return (bw + (x.weight_kg || 0)) * f - bw; }
   if (x.weight_kg == null) return null;
   return x.weight_kg * f;
 }
 function setTxt(x, mode) {
   let s;
-  if (mode === 'time') s = (x.weight_kg ? '+' + fmt(x.weight_kg) + ' kg · ' : '') + (x.duration_sec != null ? x.duration_sec + ' s' : '—');
+  const w = (mode === 'added_weight' || mode === 'bodyweight') ? (x.weight_kg ? '+' + fmt(x.weight_kg) : 'PC') : (x.weight_kg != null ? fmt(x.weight_kg) : '—');
+  if (x.set_type === 'emom') s = 'EMOM ' + (x.minutes_done != null ? x.minutes_done : '—') + '/' + (x.minutes_planned != null ? x.minutes_planned : '—') + ' min × ' + (x.reps != null ? x.reps : '—') + ' @ ' + w;
+  else if (x.set_type === 'cluster') s = w + '×(' + (x.reps_detail || '—') + ')';
+  else if (mode === 'time') s = (x.weight_kg ? '+' + fmt(x.weight_kg) + ' kg · ' : '') + (x.duration_sec != null ? x.duration_sec + ' s' : '—');
   else if (mode === 'added_weight' || mode === 'bodyweight') s = (x.weight_kg ? '+' + fmt(x.weight_kg) : 'PC') + '×' + (x.reps != null ? x.reps : '—');
   else s = (x.weight_kg != null ? fmt(x.weight_kg) : '—') + '×' + (x.reps != null ? x.reps : '—');
   if (x.rir != null) s += ' RIR' + x.rir;
-  if (x.set_type && x.set_type !== 'working') { const t = SET_TYPES.find((z) => z[0] === x.set_type); s += ' (' + (t ? t[1] : x.set_type).toLowerCase() + ')'; }
+  if (x.set_type && ['working', 'emom', 'cluster'].indexOf(x.set_type) === -1) { const t = SET_TYPES.find((z) => z[0] === x.set_type); s += ' (' + (t ? t[1] : x.set_type).toLowerCase() + ')'; }
   return s;
 }
 function historyOf(exId) {
@@ -517,12 +586,16 @@ async function api(action, payload, keepalive) {
 }
 const isNetErr = (e) => !e.kind;
 
+const OLD_SERVER_MSG = 'Tu script de Google es la versión 1 y no tiene columnas para EMOM, clusters y formato de prescripción. Esos datos quedan guardados en el teléfono: actualizá Code.gs a la versión 2 (Implementar → Gestionar implementaciones → nueva versión) y tocá "Sincronizar ahora".';
+const serverIsOld = () => db.meta.apiVersion != null && db.meta.apiVersion < 2;
+function needsV2(e) { const f = V2_FIELDS[e.table]; return !!f && f.some((k) => e.row[k] != null && e.row[k] !== ''); }
 async function pushNow(keepalive) {
   clearTimeout(syncState.timer);
   if (!db.config.apiUrl) return;
   if (syncState.inFlight) { syncState.again = true; return; }
-  const entries = Object.values(db.outbox);
-  if (!entries.length) { setSync('synced'); return; }
+  let entries = Object.values(db.outbox); let held = [];
+  if (serverIsOld()) { held = entries.filter(needsV2); entries = entries.filter((e) => !needsV2(e)); }
+  if (!entries.length) { if (held.length) { syncState.lastError = OLD_SERVER_MSG; setSync('error'); } else setSync('synced'); return; }
   syncState.inFlight = true; setSync('syncing');
   try {
     for (let i = 0; i < entries.length; i += 400) {
@@ -531,7 +604,8 @@ async function pushNow(keepalive) {
       applyResult(chunk, res);
     }
     db.meta.lastSyncAt = new Date().toISOString(); syncState.lastError = null; saveCritical();
-    setSync(pendingCount() ? 'pending' : 'synced');
+    if (held.length && serverIsOld()) { syncState.lastError = OLD_SERVER_MSG; setSync('error'); }
+    else { setSync(pendingCount() ? 'pending' : 'synced'); if (held.length) syncState.again = true; }
   } catch (e) {
     syncState.lastError = isNetErr(e) ? 'Sin conexión. Los cambios quedan guardados en el teléfono.' : e.message;
     setSync(isNetErr(e) ? 'pending' : 'error');
@@ -541,6 +615,7 @@ async function pushNow(keepalive) {
   }
 }
 function applyResult(chunk, res) {
+  if (res && res.api_version != null) db.meta.apiVersion = res.api_version;
   const sent = {};
   chunk.forEach((c) => { sent[c.table + '|' + c.row[PK[c.table]]] = c.row.updated_at; });
   (res.applied || []).forEach((a) => { const k = a.table + '|' + a.id; const e = db.outbox[k]; if (e && e.row.updated_at === a.updated_at) delete db.outbox[k]; });
@@ -567,7 +642,7 @@ async function pull() {
       const e = db.outbox[k]; const id = e.row[PK[e.table]]; const s = fresh[e.table][id];
       if (!s || !s.updated_at || e.row.updated_at > s.updated_at) fresh[e.table][id] = e.row; else delete db.outbox[k];
     }
-    db.tables = fresh; db.meta.lastPullAt = new Date().toISOString(); syncState.lastError = null;
+    db.tables = fresh; db.meta.lastPullAt = new Date().toISOString(); syncState.lastError = null; db.meta.apiVersion = data.api_version || 1;
     saveCritical(); saveTables(true);
     syncState.inFlight = false;
     if (!isEditingInput()) render();
@@ -599,14 +674,46 @@ function addSet(rexId, exId) {
   const last = existing[existing.length - 1];
   const timeBased = (rex && rex.unit === 's') || (exercise(exId) && exercise(exId).load_mode === 'time');
   const row = { set_id: uid('set'), session_id: s.session_id, exercise_id: exId, rex_id: rexId || null, set_number: existing.length + 1,
-    weight_kg: null, reps: null, duration_sec: null, rir: null, set_type: 'working', notes: null };
-  if (last) { row.weight_kg = last.weight_kg; row.reps = last.reps; row.duration_sec = last.duration_sec; row.set_type = last.set_type || 'working'; }
-  else if (rex) {
-    if (exId === rex.exercise_id) { const ld = prescribedLoad(rex, s.date); if (ld && ld.kg != null) row.weight_kg = ld.kg; }
-    const first = int(String(rex.reps || '').split('-')[0]);
-    if (timeBased) row.duration_sec = first; else row.reps = first;
+    weight_kg: null, reps: null, duration_sec: null, rir: null, set_type: 'working', notes: null, minutes_planned: null, minutes_done: null, reps_detail: null };
+  if (last) {
+    ['weight_kg', 'reps', 'duration_sec', 'set_type', 'minutes_planned', 'minutes_done', 'reps_detail'].forEach((k) => { row[k] = last[k] == null ? null : last[k]; });
+    row.set_type = row.set_type || 'working';
+  } else if (rex) {
+    const ld = prescribedLoad(rex, s.date, { sessionId: s.session_id, exId });
+    if ((exId === rex.exercise_id || rex.load_type === 'backoff') && ld && ld.kg != null) row.weight_kg = ld.kg;
+    if (rex.format === 'emom') { row.set_type = 'emom'; row.minutes_planned = rex.sets != null ? rex.sets : null; row.minutes_done = row.minutes_planned; row.reps = int(rex.reps); }
+    else if (isClusterReps(rex.reps)) { row.set_type = 'cluster'; row.reps_detail = parseCluster(rex.reps).join('+'); }
+    else { const first = int(String(rex.reps || '').split('-')[0]); if (timeBased) row.duration_sec = first; else row.reps = first; }
+    if (rex.load_type === 'backoff' && row.set_type === 'working') row.set_type = 'backoff';
   }
   put('SETS', row); changed(false);
+}
+/* Al cambiar el tipo de una serie, se acomodan sus campos (EMOM ↔ cluster ↔ normal) sin perder lo cargado. */
+function formatPatch(cur, type) {
+  const rex = cur.rex_id ? db.tables[REX][cur.rex_id] : null; const p = {};
+  const wasC = cur.set_type === 'cluster', wasE = cur.set_type === 'emom';
+  if (type === 'emom') {
+    if (wasC) { const c = parseCluster(cur.reps_detail); p.reps = c ? c[0] : cur.reps; p.reps_detail = null; }
+    const plan = cur.minutes_planned != null ? cur.minutes_planned : (rex && rex.format === 'emom' && rex.sets != null ? rex.sets : null);
+    p.minutes_planned = plan; p.minutes_done = cur.minutes_done != null ? cur.minutes_done : plan;
+    if (cur.reps == null && p.reps == null && rex && rex.format === 'emom') p.reps = int(rex.reps);
+  } else if (type === 'cluster') {
+    p.minutes_planned = null; p.minutes_done = null; p.reps = null;
+    p.reps_detail = cur.reps_detail || (rex && isClusterReps(rex.reps) ? parseCluster(rex.reps).join('+') : null);
+  } else {
+    if (wasC) { p.reps = totalReps(cur); p.reps_detail = null; }
+    if (wasE) { p.minutes_planned = null; p.minutes_done = null; }
+  }
+  return p;
+}
+function addBackoffSet(rexId, exId, kg) {
+  const { dayId, w } = ui.sess; const s = ensureSession(dayId, w);
+  const rex = rexId ? db.tables[REX][rexId] : null;
+  const existing = blockSets(s.session_id, rexId, exId); const last = existing[existing.length - 1];
+  const reps = last && last.reps != null ? last.reps : (rex ? int(String(rex.reps || '').split(/[-+]/)[0]) : null);
+  put('SETS', { set_id: uid('set'), session_id: s.session_id, exercise_id: exId, rex_id: rexId || null, set_number: existing.length + 1,
+    weight_kg: kg, reps, duration_sec: null, rir: null, set_type: 'backoff', notes: null, minutes_planned: null, minutes_done: null, reps_detail: null });
+  changed(false);
 }
 function setDone(dayId, w, on) {
   const s = on ? ensureSession(dayId, w) : sessionFor(dayId, w);
@@ -664,7 +771,7 @@ const IMPORT_FIELDS = {
   EXERCISES: ['exercise_id', 'name', 'category', 'type', 'load_mode', 'notes'],
   ROUTINES: ['routine_id', 'name', 'start_date', 'weeks', 'week_labels', 'status', 'notes'],
   ROUTINE_DAYS: ['day_id', 'routine_id', 'day_index', 'name', 'type', 'cue'],
-  ROUTINE_EXERCISES: ['rex_id', 'day_id', 'exercise_id', 'week_from', 'week_to', 'position', 'role', 'sets', 'reps', 'unit', 'load_type', 'load_value', 'pct_of', 'rir', 'rest_sec', 'notes'],
+  ROUTINE_EXERCISES: ['rex_id', 'day_id', 'exercise_id', 'week_from', 'week_to', 'position', 'role', 'sets', 'reps', 'unit', 'load_type', 'load_value', 'pct_of', 'rir', 'rest_sec', 'notes', 'format'],
   GOALS: ['goal_id', 'exercise_id', 'description', 'target_value', 'target_date', 'status'],
   BODY_METRICS: ['metric_id', 'date', 'metric', 'value', 'notes']
 };
@@ -738,6 +845,14 @@ function parseImport(text) {
       if (!r.pct_of || !refs.has(r.pct_of)) E(tag + 'pct_of debe ser un ejercicio con máximo de referencia (' + Array.from(refs).join(', ') + ').');
     }
     if (r.unit != null && ['reps', 's', 'm'].indexOf(r.unit) === -1) E(tag + 'unit debe ser reps, s o m.');
+    const repsS = r.reps == null ? '' : String(r.reps).replace(/\s+/g, '');
+    if (r.format != null && r.format !== '' && r.format !== 'emom') E(tag + 'format debe ser "emom" o null.');
+    if (repsS.indexOf('+') !== -1 && !CLUSTER_RE.test(repsS)) E(tag + 'reps de cluster debe tener el formato "3+3+3".');
+    if (r.format === 'emom') {
+      if (!Number.isInteger(r.sets) || r.sets < 1) E(tag + 'en un EMOM, sets son los minutos (entero ≥ 1).');
+      if (!/^\d+$/.test(repsS)) E(tag + 'en un EMOM, reps son las repeticiones por minuto (un solo número).');
+    }
+    if (r.load_type === 'backoff' && !(typeof r.load_value === 'number' && r.load_value > 0 && r.load_value <= 50)) E(tag + 'en un back-off, load_value es el % menos que el top set (entre 1 y 50).');
     if (!Number.isInteger(r.week_from) || !Number.isInteger(r.week_to) || r.week_from < 1 || r.week_from > r.week_to) E(tag + 'week_from y week_to deben ser números con 1 ≤ week_from ≤ week_to.');
     else if (day) {
       const rtB = RTb.get(day.routine_id); const rtC = db.tables.ROUTINES[day.routine_id];
@@ -747,6 +862,7 @@ function parseImport(text) {
     const cur = db.tables[REX][r.rex_id];
     if (cur && day) { const cd = db.tables.ROUTINE_DAYS[cur.day_id]; if (cd && cd.routine_id !== day.routine_id) E(tag + 'ese ID ya lo usa otra rutina. Cada bloque necesita IDs nuevos.'); }
   });
+  if (serverIsOld() && (out.ROUTINE_EXERCISES || []).some((r) => r.format)) warnings.push('Este bloque trae EMOM: las prescripciones se ven en la app, pero no se van a guardar en el Sheet hasta que actualices Code.gs a la versión 2.');
   if ((out.ROUTINES || []).length && !(out.ROUTINES || []).some((r) => r.status === 'active')) warnings.push('Ninguna rutina viene como "active": se importa, pero no se va a mostrar.');
   if (errors.length) return { error: errors, warnings };
   /* Bloque completo de una rutina que ya existe (fila de ROUTINES + sus días): lo que no venga en el bloque se quita.
@@ -864,7 +980,11 @@ function applyImport(p) {
   const newActive = (p.tables.ROUTINES || []).filter((r) => r.status === 'active').map((r) => r.routine_id);
   IMPORTABLE.forEach((t) => (p.tables[t] || []).forEach((r) => {
     const c = stripMeta(r); c.deleted_at = null;
-    if (t === REX) { if (c.reps != null) c.reps = String(c.reps); if (c.rir != null) c.rir = String(c.rir); }
+    if (t === REX) {
+      if (c.reps != null) c.reps = isClusterReps(c.reps) ? parseCluster(c.reps).join('+') : String(c.reps);
+      if (c.rir != null) c.rir = String(c.rir);
+      c.format = c.format || null;
+    }
     if (t === 'PROFILE' && c.value != null) c.value = String(c.value);
     if (t === 'ROUTINES') {
       const cur = db.tables.ROUTINES[c.routine_id];
@@ -901,14 +1021,18 @@ function buildSummary() {
     const groups = {}; setsOf(s.session_id).forEach((x) => { const k = (x.rex_id || '') + '|' + x.exercise_id; (groups[k] = groups[k] || []).push(x); });
     Object.values(groups).forEach((g) => {
       const rex = g[0].rex_id ? db.tables[REX][g[0].rex_id] : null; const ex = exercise(g[0].exercise_id); const mode = ex ? ex.load_mode : '';
-      L.push('  ' + exName(g[0].exercise_id) + (rex ? ' [presc: ' + specPlain(rex, s.date) + (rex.exercise_id !== g[0].exercise_id ? ', reemplaza a ' + exName(rex.exercise_id) : '') + ']' : ' [extra]') + ': ' + g.map((x) => setTxt(x, mode)).join(', '));
+      const exId = g[0].exercise_id;
+      const ton = g.reduce((a, x) => { const t = tonnage(x, exId, s.date); return t == null ? a : (a || 0) + t; }, null);
+      L.push('  ' + exName(exId) + (rex ? ' [presc: ' + specPlain(rex, s.date, { sessionId: s.session_id, exId }) + (rex.exercise_id !== exId ? ', reemplaza a ' + exName(rex.exercise_id) : '') + ']' : ' [extra]') + ': ' +
+        g.map((x) => setTxt(x, mode) + (x.set_type === 'emom' && tonnage(x, exId, s.date) != null ? ' (tonelaje ' + fmt(Math.round(tonnage(x, exId, s.date))) + ' kg)' : '')).join(', ') +
+        (ton != null && g.length > 1 ? ' · tonelaje total ' + fmt(Math.round(ton)) + ' kg' : ''));
     });
     if (s.notes) L.push('  Notas: ' + s.notes);
   });
-  L.push(''); L.push('MEJOR e1RM POR EJERCICIO (Epley con reps + RIR)');
+  L.push(''); L.push('MEJOR e1RM POR EJERCICIO (Epley con reps + RIR; solo series con RIR ≤ ' + E1RM_MAX_RIR + '; dominada, fondo y muscle up sobre carga total)');
   rows('EXERCISES').forEach((ex) => {
     let best = null; historyOf(ex.exercise_id).forEach((g) => g.sets.forEach((x) => { const v = e1rm(x, ex.exercise_id, g.ses.date); if (v != null && (!best || v > best.v)) best = { v, d: g.ses.date }; }));
-    if (best) L.push('  ' + ex.name + ': ' + (ex.load_mode === 'added_weight' ? '+' : '') + fmt(Math.round(best.v * 10) / 10) + ' kg (' + best.d + ')');
+    if (best) L.push('  ' + ex.name + ': ' + (isAdded(ex.exercise_id) ? '+' : '') + fmt(Math.round(best.v * 10) / 10) + ' kg (' + best.d + ')');
   });
   L.push(''); L.push('FORMATO PARA IMPORTAR EL PRÓXIMO BLOQUE EN LA APP');
   L.push('JSON: {"format":"streetlifting-block-v1","tables":{...}}. IDs nuevos y únicos en cada bloque (ej. rtn_b3, day_b3_1, rex_b3_d1_01_w1); nunca reutilizar IDs de bloques anteriores.');
@@ -916,9 +1040,10 @@ function buildSummary() {
   L.push('ROUTINES: routine_id, name, weeks (entero de 1 a 16, la duración real del bloque), week_labels (una etiqueta por semana separadas por "|", tantas como weeks), status ("active"), start_date (YYYY-MM-DD, primer día de la semana 1: la app calcula la semana actual con ella), notes');
   L.push('Regla de semanas: en ROUTINE_EXERCISES, 1 ≤ week_from ≤ week_to ≤ weeks. Para alargar o acortar la rutina activa, cambiá weeks y mandá la rutina completa con los mismos IDs; si no se puede (por ejemplo, acortar por debajo de una semana ya entrenada), la app lo rechaza y explica por qué.');
   L.push('ROUTINE_DAYS: day_id, routine_id, day_index (entero), name, type (heavy|tech|rest), cue (indicación técnica)');
-  L.push('ROUTINE_EXERCISES: rex_id, day_id, exercise_id, week_from, week_to, position, role (' + codesOf(ROLES).join('|') + '), sets, reps (texto: "5" o "8-10"), unit (reps|s|m), load_type (pct|kg|added_kg|bodyweight|null), load_value, pct_of (solo con pct: ' + rows('PROFILE').map((p) => p.key).filter((k) => k.indexOf('ref_max.') === 0).map((k) => k.slice(8)).join('|') + '), rir (texto), rest_sec, notes');
+  L.push('ROUTINE_EXERCISES: rex_id, day_id, exercise_id, week_from, week_to, position, role (' + codesOf(ROLES).join('|') + '), sets, reps (texto: "5", "8-10" o cluster "3+3+3"), unit (reps|s|m), load_type (pct|kg|added_kg|bodyweight|backoff|null), load_value, format (emom|null), pct_of (solo con pct: ' + rows('PROFILE').map((p) => p.key).filter((k) => k.indexOf('ref_max.') === 0).map((k) => k.slice(8)).join('|') + '), rir (texto), rest_sec, notes');
   L.push('EXERCISES (solo ejercicios nuevos): exercise_id, name, category, type (' + codesOf(EX_TYPES).join('|') + '), load_mode (' + codesOf(LOAD_MODES).join('|') + '), notes');
   L.push('PROFILE (opcional, para cambiar máximos): key "ref_max.<exercise_id>", value');
+  L.push('Formatos especiales en ROUTINE_EXERCISES: EMOM → format "emom", sets = minutos, reps = reps por minuto (la app registra minutos planificados y completados, reps por minuto, lastre y RIR al final, y calcula el tonelaje). Cluster → reps "3+3+3" (pausa fija de ' + CLUSTER_REST_SEC + ' s entre mini-bloques; se registra lo hecho por mini-bloque). Back-off → load_type "backoff", load_value = % menos que el top set del mismo ejercicio en la sesión. En dominada, fondo y muscle up todos los % (pct y backoff) se calculan sobre carga total: (peso corporal + lastre) × % − peso corporal.');
   L.push('Ejercicios que ya existen (usar SIEMPRE estos IDs para no partir el historial):');
   rows('EXERCISES').sort((a, b) => a.name.localeCompare(b.name, 'es')).forEach((e) => L.push('  ' + e.exercise_id + ' — ' + e.name + ' (' + e.load_mode + ')'));
   return L.join('\n');
@@ -926,13 +1051,14 @@ function buildSummary() {
 
 /* ============================ VISTAS ============================ */
 function pillHtml() { return '<button id="syncpill" class="pill ' + syncState.state + '" data-act="syncinfo">' + SYNC_LABEL[syncState.state] + '</button>'; }
+function oldServerBar() { return serverIsOld() ? '<p class="warnbar">Actualizá el script de Google (Code.gs) a la versión 2 para que los EMOM, clusters y formatos de prescripción se guarden en tu Sheet. Hasta entonces quedan guardados en el teléfono.</p>' : ''; }
 function topbar() {
   return '<div class="topbar">' + pillHtml() + '<div class="topnav">' +
     '<button class="navbtn" data-act="go" data-view="library">Ejercicios</button>' +
     '<button class="navbtn" data-act="go" data-view="edit">Editar rutina</button>' +
-    '<button class="navbtn" data-act="go" data-view="settings" aria-label="Ajustes">⚙</button></div></div>';
+    '<button class="navbtn" data-act="go" data-view="settings" aria-label="Ajustes">⚙</button></div></div>' + oldServerBar();
 }
-function backbar(target) { return '<div class="topbar"><button class="back" data-act="go" data-view="' + target + '">← Volver</button><div class="topnav">' + pillHtml() + '</div></div>'; }
+function backbar(target) { return '<div class="topbar"><button class="back" data-act="go" data-view="' + target + '">← Volver</button><div class="topnav">' + pillHtml() + '</div></div>' + oldServerBar(); }
 
 function hero() {
   const total = MAIN_LIFTS.reduce((s, [id]) => s + (mainMax(id) || 0), 0);
@@ -987,14 +1113,31 @@ function setHead(mode, timeBased, repLabel) {
   const kg = (mode === 'added_weight' || mode === 'bodyweight') ? '+kg' : 'kg';
   return '<div class="setrow head"><span>#</span><span>' + kg + '</span><span>' + (timeBased ? 'seg' : (repLabel || 'reps')) + '</span><span>RIR</span><span>tipo</span><span></span></div>';
 }
-function setRow(x, i, mode, timeBased) {
+function setSubHtml(x, date) {
   const v = (n) => (n == null ? '' : fmt(n));
-  return '<div class="setrow"><span class="snum">' + (i + 1) + '</span>' +
+  if (x.set_type === 'emom') {
+    const t = tonnage(x, x.exercise_id, date);
+    return '<div class="setsub"><label>Min. planif. <input type="number" inputmode="numeric" min="1" data-set="' + x.set_id + '" data-f="minutes_planned" value="' + v(x.minutes_planned) + '"></label>' +
+      '<label>Min. hechos <input type="number" inputmode="numeric" min="0" data-set="' + x.set_id + '" data-f="minutes_done" value="' + v(x.minutes_done) + '"></label>' +
+      '<span data-ton="' + x.set_id + '">' + (t != null ? 'Tonelaje <b>' + fmt(Math.round(t)) + ' kg</b>' : 'Tonelaje: faltan minutos o reps') + ' · reps = por minuto · RIR al final</span></div>';
+  }
+  if (x.set_type === 'cluster') {
+    const c = parseCluster(x.reps_detail);
+    return '<div class="setsub"><span data-ton="' + x.set_id + '">' + (c ? 'Total <b>' + c.reduce((a, b) => a + b, 0) + ' reps</b> en ' + c.length + ' mini-bloques' : 'Cargá las reps de cada mini-bloque, ej. 3+3+3') + ' · pausa ' + CLUSTER_REST_SEC + ' s entre mini-bloques · RIR al final</span></div>';
+  }
+  return '';
+}
+function setRow(x, i, mode, timeBased, date) {
+  const v = (n) => (n == null ? '' : fmt(n));
+  const repsInput = x.set_type === 'cluster'
+    ? '<input type="text" inputmode="text" autocomplete="off" data-set="' + x.set_id + '" data-f="reps_detail" value="' + esc(x.reps_detail || '') + '" placeholder="3+3+3" aria-label="Reps por mini-bloque">'
+    : '<input type="number" inputmode="numeric" data-set="' + x.set_id + '" data-f="' + (timeBased && x.set_type !== 'emom' ? 'duration_sec' : 'reps') + '" value="' + v(timeBased && x.set_type !== 'emom' ? x.duration_sec : x.reps) + '" aria-label="' + (x.set_type === 'emom' ? 'Reps por minuto' : timeBased ? 'Segundos' : 'Repeticiones') + '">';
+  return '<div class="setrow' + (x.set_type === 'cluster' ? ' cl' : '') + '"><span class="snum">' + (i + 1) + '</span>' +
     '<input type="number" inputmode="decimal" step="0.5" data-set="' + x.set_id + '" data-f="weight_kg" value="' + v(x.weight_kg) + '" placeholder="' + ((mode === 'added_weight' || mode === 'bodyweight' || timeBased) ? '0' : '') + '" aria-label="Peso">' +
-    '<input type="number" inputmode="numeric" data-set="' + x.set_id + '" data-f="' + (timeBased ? 'duration_sec' : 'reps') + '" value="' + v(timeBased ? x.duration_sec : x.reps) + '" aria-label="' + (timeBased ? 'Segundos' : 'Repeticiones') + '">' +
+    repsInput +
     '<input type="number" inputmode="numeric" min="0" max="10" data-set="' + x.set_id + '" data-f="rir" value="' + v(x.rir) + '" aria-label="RIR">' +
     '<select data-set="' + x.set_id + '" data-f="set_type" aria-label="Tipo de serie">' + options(SET_TYPES, x.set_type || 'working') + '</select>' +
-    '<button class="xbtn" data-act="del-set" data-id="' + x.set_id + '" aria-label="Borrar serie">✕</button></div>';
+    '<button class="xbtn" data-act="del-set" data-id="' + x.set_id + '" aria-label="Borrar serie">✕</button></div>' + setSubHtml(x, date);
 }
 function blockHtml(rex, sets, key, s, exFallback) {
   const sub = rex ? (ui.subs[key] || {})[rex.rex_id] : null;
@@ -1005,14 +1148,16 @@ function blockHtml(rex, sets, key, s, exFallback) {
   let h = '<div class="block ' + esc(role) + '"><div class="blockhead"><span class="bname exlink" data-act="ex" data-id="' + esc(exId) + '">' + esc(exName(exId)) + '</span>' +
     (rex ? '<button class="btn sm ghost" data-act="sub" data-rex="' + esc(rex.rex_id) + '">Cambiar hoy</button>' : '') + '</div>';
   if (rex) {
-    const p = specHtml(rex, s ? s.date : null);
+    const p = specHtml(rex, s ? s.date : null, { sessionId: s ? s.session_id : null, exId });
     h += '<p class="presc">' + (exId !== rex.exercise_id ? 'Reemplaza a ' + esc(exName(rex.exercise_id)) + ' · ' : '') + 'Prescripción: ' + (p || '—') +
       (rex.notes ? ' · ' + esc(rex.notes) : '') + (rex.deleted_at ? ' <span class="pct">(versión anterior de la rutina)</span>' : '') + '</p>';
   } else h += '<p class="presc">Ejercicio extra (sin prescripción)</p>';
   const last = lastSessionSets(exId, s ? s.session_id : null);
   if (last) h += '<p class="lastline">Última vez (' + fmtDate(last.date) + '): ' + esc(last.sets.map((x) => setTxt(x, mode)).join(', ')) + '</p>';
-  h += '<div class="setgrid">' + (sets.length ? setHead(mode, timeBased, rex && rex.unit === 'm' ? 'metros' : 'reps') + sets.map((x, i) => setRow(x, i, mode, timeBased)).join('') : '') + '</div>';
-  h += '<button class="btn sm" data-act="add-set" data-rex="' + esc(rex ? rex.rex_id : '') + '" data-ex="' + esc(exId) + '">+ Serie</button>';
+  h += '<div class="setgrid">' + (sets.length ? setHead(mode, timeBased, rex && rex.unit === 'm' ? 'metros' : 'reps') + sets.map((x, i) => setRow(x, i, mode, timeBased, s ? s.date : todayLocal())).join('') : '') + '</div>';
+  const addLbl = rex && rex.format === 'emom' ? '+ EMOM' : rex && isClusterReps(rex.reps) ? '+ Cluster' : '+ Serie';
+  h += '<button class="btn sm" data-act="add-set" data-rex="' + esc(rex ? rex.rex_id : '') + '" data-ex="' + esc(exId) + '">' + addLbl + '</button>';
+  if (!timeBased && (mode === 'barbell' || mode === 'external' || isTotalLoad(exId))) h += ' <button class="btn sm ghost" data-act="backoff" data-rex="' + esc(rex ? rex.rex_id : '') + '" data-ex="' + esc(exId) + '">Back-off</button>';
   if (!rex && !sets.length) h += ' <button class="btn sm ghost" data-act="rm-extra" data-ex="' + esc(exId) + '">Quitar</button>';
   return h + '</div>';
 }
@@ -1069,7 +1214,7 @@ function viewExercise() {
   if (!hist.length) {
     return h + '<p class="note">Todavía no hay series registradas de este ejercicio.</p><button class="btn block ghost" data-act="edit-ex" data-id="' + esc(exId) + '">Editar ejercicio</button>';
   }
-  const canE1 = mode === 'barbell' || mode === 'external' || mode === 'added_weight';
+  const canE1 = mode === 'barbell' || mode === 'external' || mode === 'added_weight' || isTotalLoad(exId);
   let best = null, bestW = null, bestReps = null, bestDur = null, runBest = -Infinity; const prIds = new Set(); let totalSets = 0;
   const points = hist.map((g) => {
     let pe = null, pw = null, preps = null, pdur = null;
@@ -1078,24 +1223,26 @@ function viewExercise() {
       const v = canE1 ? e1rm(x, exId, g.ses.date) : null;
       if (v != null) { if (v > runBest + 1e-9) { if (runBest !== -Infinity) prIds.add(x.set_id); runBest = v; } if (!best || v > best.v) best = { v, x, d: g.ses.date }; if (pe == null || v > pe) pe = v; }
       if (x.weight_kg != null) { if (!bestW || x.weight_kg > bestW.v) bestW = { v: x.weight_kg, d: g.ses.date }; if (pw == null || x.weight_kg > pw) pw = x.weight_kg; }
-      if (x.reps != null) { if (!bestReps || x.reps > bestReps.v) bestReps = { v: x.reps, x, d: g.ses.date }; if (preps == null || x.reps > preps) preps = x.reps; }
+      const rp = x.set_type === 'cluster' ? totalReps(x) : x.reps;
+      if (rp != null) { if (!bestReps || rp > bestReps.v) bestReps = { v: rp, x, d: g.ses.date }; if (preps == null || rp > preps) preps = rp; }
       if (x.duration_sec != null) { if (!bestDur || x.duration_sec > bestDur.v) bestDur = { v: x.duration_sec, d: g.ses.date }; if (pdur == null || x.duration_sec > pdur) pdur = x.duration_sec; }
     });
     return { label: fmtDate(g.ses.date), e1: pe, w: pw, reps: preps, dur: pdur };
   });
   const lastG = hist[hist.length - 1];
-  const vol = lastG.sets.reduce((s, x) => s + (x.weight_kg || 0) * (x.reps || 0), 0);
+  const tonOf = (g) => g.sets.reduce((a, x) => { const t = tonnage(x, exId, g.ses.date); return t == null ? a : (a || 0) + t; }, null);
+  const vol = tonOf(lastG);
   const sign = (mode === 'added_weight' || mode === 'bodyweight') ? '+' : '';
   const stat = (label, value, small) => '<div class="stat"><span>' + label + '</span><b>' + value + '</b>' + (small ? '<small>' + small + '</small>' : '') + '</div>';
   h += '<div class="stats">' + stat('Última vez', fmtDate(lastG.ses.date), daysAgo(lastG.ses.date));
   if (mode === 'time') h += stat('Mejor tiempo', bestDur ? bestDur.v + ' s' : '—', bestDur ? fmtDate(bestDur.d) : '');
   else h += stat('Mejor peso', bestW ? sign + fmt(bestW.v) + ' kg' : '—', bestW ? fmtDate(bestW.d) : '');
   if (canE1) {
-    h += stat('PR (e1RM)', best ? sign + fmt(Math.round(best.v * 10) / 10) + ' kg' : '—', best ? fmtDate(best.d) : 'necesita reps ≤ 12');
+    h += stat('PR (e1RM)', best ? sign + fmt(Math.round(best.v * 10) / 10) + ' kg' : '—', best ? fmtDate(best.d) : 'necesita una serie con RIR ≤ ' + E1RM_MAX_RIR);
     h += stat('Mejor serie', best ? esc(setTxt(best.x, mode)) : '—', best ? fmtDate(best.d) : '');
   } else if (mode !== 'time') h += stat('Más reps', bestReps ? bestReps.v : '—', bestReps ? fmtDate(bestReps.d) : '');
   h += stat('Registro', hist.length + ' sesiones', totalSets + ' series');
-  if (vol > 0 && mode !== 'added_weight') h += stat('Volumen última', fmt(vol) + ' kg', 'peso × reps');
+  if (vol != null && vol > 0) h += stat('Tonelaje última', fmt(Math.round(vol)) + ' kg', isTotalLoad(exId) ? 'reps × (peso corporal + lastre)' : 'reps × peso');
   h += '</div>';
   h += '<p class="eyebrow">Series de la última sesión</p><div class="chips" style="margin:0 0 14px">' + lastG.sets.map((x) => '<span class="chipx' + (prIds.has(x.set_id) ? ' pr' : '') + '">' + esc(setTxt(x, mode)) + (prIds.has(x.set_id) ? '<em>PR</em>' : '') + '</span>').join('') + '</div>';
   const series = canE1 ? [{ key: 'e1', label: 'e1RM', color: 'var(--iron)' }, { key: 'w', label: 'Mejor peso', color: 'var(--tech)', dash: true }]
@@ -1105,9 +1252,9 @@ function viewExercise() {
     const d = db.tables.ROUTINE_DAYS[g.ses.day_id]; let be = null; g.sets.forEach((x) => { const v = canE1 ? e1rm(x, exId, g.ses.date) : null; if (v != null && (be == null || v > be)) be = v; });
     return '<div class="sessitem"><div class="sesshead"><b>' + fmtDate(g.ses.date) + '</b><span>' + esc(d ? 'S' + g.ses.week + ' · ' + d.name : 'Sesión libre') + '</span></div><div class="chips">' +
       g.sets.map((x) => '<span class="chipx' + (prIds.has(x.set_id) ? ' pr' : '') + '">' + esc(setTxt(x, mode)) + (prIds.has(x.set_id) ? '<em>PR</em>' : '') + '</span>').join('') + '</div>' +
-      (be != null ? '<p class="lastline">e1RM de la sesión: ' + sign + fmt(Math.round(be * 10) / 10) + ' kg</p>' : '') + '</div>';
+      ((be != null || tonOf(g) != null) ? '<p class="lastline">' + [be != null ? 'e1RM de la sesión: ' + sign + fmt(Math.round(be * 10) / 10) + ' kg' : '', tonOf(g) != null ? 'tonelaje ' + fmt(Math.round(tonOf(g))) + ' kg' : ''].filter(Boolean).join(' · ') + '</p>' : '') + '</div>';
   }).join('') + '</div>';
-  h += '<p class="footnote">e1RM calculado con Epley usando reps + RIR (solo series de hasta 12). En ejercicios lastrados incluye tu peso corporal de esa fecha.</p>';
+  h += '<p class="footnote">e1RM con Epley usando reps + RIR. Solo cuentan series con RIR anotado de ' + E1RM_MAX_RIR + ' o menos (y reps + RIR hasta 12). En clusters se usa el último mini-bloque; en EMOM, las reps del último minuto. En dominada, fondo y muscle up se calcula sobre la carga total: tu peso corporal de esa fecha + el lastre.</p>';
   return h + '<button class="btn block ghost" data-act="edit-ex" data-id="' + esc(exId) + '">Editar ejercicio</button>';
 }
 function viewLibrary() {
@@ -1182,8 +1329,9 @@ function modalHtml(m) {
       '<label class="field">Ejercicio<select id="f-ex">' + exOptions(v.exercise_id, true) + '</select></label>' +
       '<label class="field">Día<select id="f-day">' + options(days, v.day_id) + '</select></label>' +
       '<div class="row3"><label class="field">Series<input id="f-sets" type="number" inputmode="numeric" value="' + esc(v.sets == null ? '' : v.sets) + '"></label>' +
-      '<label class="field">Reps / seg<input id="f-reps" type="text" value="' + esc(v.reps == null ? '' : v.reps) + '" placeholder="5 o 8-10"></label>' +
+      '<label class="field">Reps / seg<input id="f-reps" type="text" value="' + esc(v.reps == null ? '' : v.reps) + '" placeholder="5, 8-10 o 3+3+3"></label>' +
       '<label class="field">Unidad<select id="f-unit">' + options([['reps', 'reps'], ['s', 'segundos']], v.unit || 'reps') + '</select></label></div>' +
+      '<label class="field">Formato<select id="f-fmt">' + options([['', 'Series normales (cluster: reps 3+3+3)'], ['emom', 'EMOM (series = minutos, reps por minuto)']], v.format || '') + '</select></label>' +
       '<div class="row2"><label class="field">Carga<select id="f-lt">' + options(LOAD_TYPES, v.load_type || '') + '</select></label>' +
       '<label class="field">Valor (% o kg)<input id="f-lv" type="number" step="0.5" inputmode="decimal" value="' + esc(v.load_value == null ? '' : fmt(v.load_value)) + '"></label></div>' +
       '<label class="field">Si es %, calculado sobre<select id="f-pct">' + options([['', '—']].concat(pctList), v.pct_of || '') + '</select></label>' +
@@ -1287,6 +1435,16 @@ function modalHtml(m) {
     if (m.plan.notes.length) h += '<p class="msg">Para tu información:</p><ul class="msglist">' + m.plan.notes.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>';
     return h + '<div class="sheetbtns">' + (m.type === 'repair' && !m.done && items.length ? '<button class="btn ghost" data-act="close-modal">Ahora no</button><button class="btn primary" data-act="apply-repair">Ordenar</button>' : '<button class="btn primary" data-act="close-modal">Listo</button>') + '</div>';
   }
+  if (m.type === 'backoff') {
+    const added = isAdded(m.exId);
+    return '<h3>Back-off · ' + esc(exName(m.exId)) + '</h3>' +
+      '<div class="' + (added ? 'row3' : 'row2') + '"><label class="field">' + (added ? 'Lastre top set (kg)' : 'Top set (kg)') + '<input id="bo-top" data-bo="1" type="number" step="0.5" inputmode="decimal" value="' + esc(m.top == null ? '' : fmt(m.top)) + '"></label>' +
+      (added ? '<label class="field">Peso corporal (kg)<input id="bo-bw" data-bo="1" type="number" step="0.1" inputmode="decimal" value="' + esc(m.bw == null ? '' : fmt(m.bw)) + '"></label>' : '') +
+      '<label class="field">Bajar (%)<input id="bo-pct" data-bo="1" type="number" step="1" inputmode="numeric" value="' + esc(m.pct == null ? '' : fmt(m.pct)) + '"></label></div>' +
+      '<div class="boline" id="bo-result">' + backoffResultHtml(m) + '</div>' +
+      '<p class="msg">' + (added ? 'El % se aplica sobre la carga total (peso corporal + lastre), no solo sobre el lastre.' : 'El % se aplica sobre el peso del top set.') + ' Redondeado a 2.5 kg.</p>' +
+      '<div class="sheetbtns"><button class="btn ghost" data-act="close-modal">Cerrar</button><button class="btn primary" data-act="bo-add" id="bo-add"' + (backoffFromModal(m) ? '' : ' disabled') + '>Agregar serie back-off</button></div>';
+  }
   if (m.type === 'syncinfo') {
     return '<h3>' + SYNC_LABEL[syncState.state] + '</h3><p class="msg" style="margin-top:0">Cambios pendientes: ' + pendingCount() +
       (syncState.lastError ? '<br>' + esc(syncState.lastError) : '') + '<br>Tus datos quedan guardados en el teléfono hasta que se suban al Sheet.</p>' +
@@ -1355,6 +1513,14 @@ document.addEventListener('click', async (e) => {
     case 'ex': ui.prevView = ui.view === 'exercise' ? ui.prevView : ui.view; ui.exId = d.id; go('exercise'); break;
     case 'add-set': addSet(d.rex || null, d.ex); render(); break;
     case 'del-set': softDelete('SETS', d.id); changed(false); render(); break;
+    case 'backoff': {
+      const s = sessionFor(ui.sess.dayId, ui.sess.w); const rex = d.rex ? db.tables[REX][d.rex] : null;
+      const top = s ? topSetFor(s.session_id, d.ex) : null;
+      openModal({ type: 'backoff', rexId: d.rex || null, exId: d.ex, top: top ? (top.weight_kg || 0) : null,
+        bw: bodyweight(s ? s.date : todayLocal()), pct: rex && rex.load_type === 'backoff' && rex.load_value != null ? rex.load_value : 10 });
+      break;
+    }
+    case 'bo-add': { readBackoff(); const m = ui.modal; const c = backoffFromModal(m); if (!c) return; addBackoffSet(m.rexId, m.exId, c.kg); closeModal(); render(); break; }
     case 'sub': {
       const s = sessionFor(ui.sess.dayId, ui.sess.w); const rex = db.tables[REX][d.rex];
       const bs = s ? blockSets(s.session_id, d.rex) : [];
@@ -1391,6 +1557,8 @@ document.addEventListener('click', async (e) => {
       const exId = val('f-ex');
       if (!exId || exId === '__new') { ui.modal.err = 'Elegí un ejercicio.'; ui.modal.draft = readRexForm(); renderModal(); return; }
       const patch = readRexForm();
+      const ferr = rexFormError(patch); if (ferr) { ui.modal.err = ferr; ui.modal.draft = patch; renderModal(); return; }
+      if (isClusterReps(patch.reps)) patch.reps = parseCluster(patch.reps).join('+');
       if (ui.modal.rexId) forwardEdit(ui.modal.rexId, patch, ui.editWeek);
       else { const rt = activeRoutine(); put(REX, Object.assign({ rex_id: uid('rex'), week_from: ui.editWeek, week_to: routineWeeks(rt), position: nextPos(patch.day_id, ui.editWeek) }, patch)); }
       changed(false); closeModal(); render(); break;
@@ -1465,6 +1633,24 @@ document.addEventListener('click', async (e) => {
     }
   }
 });
+function backoffFromModal(m) {
+  if (m.top == null || m.pct == null || !(m.pct > 0 && m.pct < 100)) return null;
+  return backoffCalc(m.top, m.pct, m.exId, isAdded(m.exId) ? m.bw : null);
+}
+function backoffResultHtml(m) {
+  const c = backoffFromModal(m);
+  if (!c) return isAdded(m.exId) && m.bw == null ? 'Cargá tu peso corporal.' : 'Cargá el top set y el %.';
+  const r1 = (v) => fmt(Math.round(v * 10) / 10);
+  if (c.added) return '(' + fmt(m.bw) + ' + ' + fmt(m.top) + ') × (1 − ' + fmt(m.pct) + '%) − ' + fmt(m.bw) + ' = ' + r1(c.exact) + ' kg<br>Back-off: <b>+' + fmt(c.kg) + ' kg</b> · carga total ' + r1(m.bw + c.kg) + ' kg' + (c.exact < 0 ? '<br>Queda por debajo de tu peso corporal: va sin lastre.' : '');
+  return fmt(m.top) + ' × (1 − ' + fmt(m.pct) + '%) = ' + r1(c.exact) + ' kg<br>Back-off: <b>' + fmt(c.kg) + ' kg</b>';
+}
+function readBackoff() {
+  const m = ui.modal; if (!m || m.type !== 'backoff') return;
+  m.top = num(val('bo-top')); m.pct = num(val('bo-pct')); if (isAdded(m.exId)) m.bw = num(val('bo-bw'));
+  const r = document.getElementById('bo-result'); if (r) r.innerHTML = backoffResultHtml(m);
+  const b = document.getElementById('bo-add'); if (b) b.disabled = !backoffFromModal(m);
+}
+document.addEventListener('input', (e) => { if (e.target && e.target.dataset && e.target.dataset.bo) readBackoff(); });
 function readRoutineDraft() {
   const m = ui.modal; if (!m || m.type !== 'routine') return;
   document.querySelectorAll('[data-wlabel]').forEach((el) => { m.draft.labels[+el.dataset.wlabel - 1] = el.value; });
@@ -1474,15 +1660,33 @@ function readRexForm() {
   const lt = val('f-lt');
   return { exercise_id: val('f-ex') === '__new' ? '' : val('f-ex'), day_id: val('f-day'), sets: int(val('f-sets')), reps: val('f-reps').trim() || null,
     unit: val('f-unit') || 'reps', load_type: lt || null, load_value: num(val('f-lv')), pct_of: lt === 'pct' ? (val('f-pct') || null) : null,
-    rir: val('f-rir').trim() || null, rest_sec: int(val('f-rest')), role: val('f-role'), notes: val('f-notes').trim() || null };
+    rir: val('f-rir').trim() || null, rest_sec: int(val('f-rest')), role: val('f-role'), notes: val('f-notes').trim() || null, format: val('f-fmt') || null };
+}
+function rexFormError(r) {
+  const repsS = String(r.reps || '').replace(/\s+/g, '');
+  if (repsS.indexOf('+') !== -1 && !CLUSTER_RE.test(repsS)) return 'Las reps de un cluster van como 3+3+3.';
+  if (r.format === 'emom' && (!Number.isInteger(r.sets) || r.sets < 1)) return 'En un EMOM, "Series" son los minutos.';
+  if (r.format === 'emom' && !/^\d+$/.test(repsS)) return 'En un EMOM, "Reps" son las repeticiones por minuto (un solo número).';
+  if (r.load_type === 'backoff' && !(r.load_value > 0 && r.load_value <= 50)) return 'En un back-off, el valor es el % menos que el top set (entre 1 y 50).';
+  return null;
 }
 document.addEventListener('change', (e) => {
   const el = e.target; const d = el.dataset || {};
   if (d.done) { setDone(d.day, +d.w, el.checked); render(); return; }
   if (d.set) {
-    const f = d.f; let v = el.value;
-    v = f === 'set_type' ? v : (f === 'weight_kg' ? num(v) : int(v));
-    put('SETS', { set_id: d.set, [f]: v }); changed(false); return;
+    const f = d.f; let v = el.value; const cur = db.tables.SETS[d.set]; if (!cur) return;
+    if (f === 'set_type') { put('SETS', Object.assign({ set_id: d.set, set_type: v }, formatPatch(cur, v))); changed(false); render(); return; }
+    if (f === 'reps_detail') {
+      const c = parseCluster(v);
+      if (v.trim() && !c) { el.classList.add('bad'); el.setAttribute('aria-invalid', 'true'); el.title = 'Formato 3+3+3'; return; }
+      el.classList.remove('bad'); el.removeAttribute('aria-invalid');
+      v = c ? c.join('+') : null; el.value = v || '';
+    } else v = f === 'weight_kg' ? num(v) : int(v);
+    const row = put('SETS', { set_id: d.set, [f]: v }); changed(false);
+    const ses = db.tables.SESSIONS[row.session_id];
+    const t = document.querySelector('[data-ton="' + d.set + '"]');
+    if (t && (row.set_type === 'emom' || row.set_type === 'cluster')) { const tmp = document.createElement('div'); tmp.innerHTML = setSubHtml(row, ses ? ses.date : todayLocal()); const n = tmp.querySelector('[data-ton]'); if (n) t.innerHTML = n.innerHTML; }
+    return;
   }
   if (d.sessfield) {
     const s = ensureSession(ui.sess.dayId, ui.sess.w);

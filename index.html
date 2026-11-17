@@ -73,6 +73,9 @@
   .bodystats{ margin:10px 0 0; font-size:12px; color:var(--text-muted); }
 
   .weeknav{ display:flex; gap:8px; padding:18px 0 0; }
+  .weeknav.many{ gap:5px; }
+  .weeknav.many .wtab{ font-size:16px; padding:9px 0; }
+  .wtab.now{ box-shadow:inset 0 -3px 0 var(--iron); }
   .wtab{
     flex:1; padding:10px 0; font:600 18px/1 "Barlow Condensed",sans-serif;
     background:var(--surface); border:1px solid var(--line); border-radius:3px;
@@ -328,6 +331,20 @@ function put(table, patch) {
 }
 function softDelete(table, id) { return put(table, { [PK[table]]: id, deleted_at: new Date().toISOString() }); }
 
+function weightLog() {
+  return rows('BODY_METRICS').filter((m) => m.metric === 'weight_kg' && m.value != null && normDate(m.date))
+    .sort((a, b) => normDate(a.date).localeCompare(normDate(b.date)) || (a.created_at || '').localeCompare(b.created_at || ''));
+}
+function weightSummary() {
+  const log = weightLog(); if (!log.length) return ['Peso corporal: sin registros'];
+  const last = log[log.length - 1]; const today = todayLocal(); const out = [];
+  const delta = (days) => { const ref = log.filter((m) => normDate(m.date) <= minusDays(today, days)).pop(); if (!ref || ref === last) return null; const d = Math.round((last.value - ref.value) * 10) / 10; return (d > 0 ? '+' : '') + fmt(d) + ' kg desde ' + normDate(ref.date); };
+  const parts = [delta(28), delta(56)].filter(Boolean);
+  out.push('Peso corporal: ' + fmt(last.value) + ' kg (registrado ' + normDate(last.date) + ')' + (parts.length ? ' · cambio: ' + parts.join(' | ') : ''));
+  const recent = log.filter((m) => normDate(m.date) >= minusDays(today, 84));
+  if (recent.length > 1) out.push('Registros de peso (últimas 12 semanas): ' + recent.map((m) => normDate(m.date) + ' ' + fmt(m.value)).join(' · '));
+  return out;
+}
 function bodyweight(date) {
   const list = rows('BODY_METRICS').filter((m) => m.metric === 'weight_kg' && m.value != null)
     .sort((a, b) => (a.date || '').localeCompare(b.date || '') || (a.created_at || '').localeCompare(b.created_at || ''));
@@ -342,14 +359,57 @@ function rexFor(dayId, w) {
   return rows(REX).filter((r) => r.day_id === dayId && (r.week_from || 1) <= w && w <= (r.week_to || 99))
     .sort((a, b) => (a.position || 0) - (b.position || 0) || a.rex_id.localeCompare(b.rex_id));
 }
-function weekLabels(rt) { return String(rt.week_labels || '').split('|'); }
+function weekLabels(rt) { return String(rt.week_labels || '').split('|').map((x) => x.trim()); }
+/* Cantidad de semanas de la rutina: sale de ROUTINES.weeks (4 solo si el dato falta). */
+function routineWeeks(rt) { const n = Number(rt && rt.weeks); return Number.isInteger(n) && n >= 1 ? n : 4; }
+function normDate(d) { const m = String(d == null ? '' : d).match(/^(\d{4}-\d{2}-\d{2})/); return m && !isNaN(Date.parse(m[1] + 'T12:00:00')) ? m[1] : null; }
+function daysBetween(a, b) { return Math.round((Date.parse(b + 'T12:00:00') - Date.parse(a + 'T12:00:00')) / 86400000); }
+function routineDayIds(rid) { return new Set(rows('ROUTINE_DAYS').filter((d) => d.routine_id === rid).map((d) => d.day_id)); }
+/* Inicio de la rutina: start_date; si falta, la primera sesión registrada en ella. */
+function routineStart(rt) {
+  const sd = normDate(rt.start_date); if (sd) return sd;
+  const ids = routineDayIds(rt.routine_id);
+  const ds = rows('SESSIONS').filter((x) => ids.has(x.day_id)).map((x) => normDate(x.date)).filter(Boolean).sort();
+  return ds[0] || null;
+}
+/* Semana actual = ((hoy − start_date) en días / 7) + 1, con tope en ROUTINES.weeks. */
+function currentWeek(rt) {
+  const n = routineWeeks(rt); const start = routineStart(rt);
+  if (!start) return 1;
+  const d = daysBetween(start, todayLocal());
+  return d < 0 ? 1 : Math.min(n, Math.floor(d / 7) + 1);
+}
+/* Semanas por encima de n con entrenamientos registrados (bloquean acortar la rutina). */
+function weeksWithSessions(rid, n) {
+  const ids = routineDayIds(rid);
+  return Array.from(new Set(rows('SESSIONS').filter((x) => ids.has(x.day_id) && x.week > n).map((x) => x.week))).sort((a, b) => a - b);
+}
+/* Cambia la duración sin tocar historial. Alargar: lo que termina en la última semana se extiende (la semana nueva arranca como copia).
+   Acortar: lo que empieza después se quita (deleted_at) y lo que cruza el límite se recorta. */
+function planResize(rid, oldN, newN, skip) {
+  const ops = { extend: [], clamp: [], drop: [] };
+  if (newN === oldN) return ops;
+  const ids = routineDayIds(rid);
+  rows(REX).forEach((r) => {
+    if (!ids.has(r.day_id) || (skip && skip.has(r.rex_id))) return;
+    const to = r.week_to == null ? oldN : r.week_to; const from = r.week_from || 1;
+    if (newN > oldN && to === oldN) ops.extend.push(r.rex_id);
+    if (newN < oldN) { if (from > newN) ops.drop.push(r.rex_id); else if (to > newN) ops.clamp.push(r.rex_id); }
+  });
+  ops.to = newN; return ops;
+}
+function applyResize(ops) {
+  if (!ops) return;
+  ops.drop.forEach((id) => softDelete(REX, id));
+  ops.extend.concat(ops.clamp).forEach((id) => put(REX, { rex_id: id, week_to: ops.to }));
+}
+function resizeText(ops, oldN, newN) {
+  if (!ops || newN === oldN) return '';
+  if (newN > oldN) return 'Pasa de ' + oldN + ' a ' + newN + ' semanas: ' + (ops.extend.length ? ops.extend.length + ' prescripciones de la semana ' + oldN + ' se extienden, así ' + (newN - oldN === 1 ? 'la semana ' + newN + ' arranca' : 'las semanas nuevas arrancan') + ' como copia de la semana ' + oldN + '.' : 'las semanas nuevas quedan vacías.');
+  return 'Pasa de ' + oldN + ' a ' + newN + ' semanas: se ajustan ' + (ops.drop.length + ops.clamp.length) + ' prescripciones que pasaban de la semana ' + newN + '.';
+}
 function sessionFor(dayId, w) { return rows('SESSIONS').filter((s) => s.day_id === dayId && s.week === w).sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))[0] || null; }
 function setsOf(sid) { return rows('SETS').filter((s) => s.session_id === sid).sort((a, b) => (a.created_at || '').localeCompare(b.created_at || '')); }
-function currentWeek(rt) {
-  const n = rt.weeks || 4; const days = routineDays(rt.routine_id).filter((d) => d.type !== 'rest');
-  for (let w = 1; w <= n; w++) { if (days.some((d) => { const s = sessionFor(d.day_id, w); return !(s && s.finished_at); })) return w; }
-  return n;
-}
 
 /* ---------- Cálculo de cargas (nada de esto se guarda) ---------- */
 const round25 = (x) => Math.round(x / 2.5) * 2.5;
@@ -647,7 +707,15 @@ function parseImport(text) {
   (out.ROUTINES || []).forEach((r) => {
     const tag = 'Rutina ' + r.routine_id + ': ';
     if (['active', 'completed', 'draft'].indexOf(r.status) === -1) E(tag + 'falta status ("active" para que se muestre).');
-    if (!Number.isInteger(r.weeks) || r.weeks < 1) E(tag + 'weeks debe ser un número entero.');
+    if (!Number.isInteger(r.weeks) || r.weeks < 1 || r.weeks > 16) E(tag + 'weeks debe ser un número entero entre 1 y 16.');
+    if (r.start_date != null && r.start_date !== '' && !normDate(r.start_date)) E(tag + 'start_date debe tener formato YYYY-MM-DD.');
+    if (Number.isInteger(r.weeks) && r.week_labels != null) { const nl = String(r.week_labels).split('|').length; if (nl !== r.weeks) warnings.push(tag + 'trae ' + nl + ' etiquetas de semana para ' + r.weeks + ' semanas.'); }
+    const cur = db.tables.ROUTINES[r.routine_id];
+    if (cur && Number.isInteger(r.weeks) && r.weeks < routineWeeks(cur)) {
+      const busy = weeksWithSessions(r.routine_id, r.weeks);
+      if (busy.length) E(tag + 'ya registraste entrenamientos en la semana ' + busy.join(', ') + '; no se puede acortar a ' + r.weeks + ' semanas.');
+    }
+    if (!cur && !normDate(r.start_date) && r.status === 'active') warnings.push(tag + 'no trae start_date: se toma hoy (' + todayLocal() + ') como inicio. Podés cambiarlo en Editar rutina.');
   });
   (out.ROUTINE_DAYS || []).forEach((d) => {
     const tag = 'Día ' + d.day_id + ': ';
@@ -670,7 +738,12 @@ function parseImport(text) {
       if (!r.pct_of || !refs.has(r.pct_of)) E(tag + 'pct_of debe ser un ejercicio con máximo de referencia (' + Array.from(refs).join(', ') + ').');
     }
     if (r.unit != null && ['reps', 's', 'm'].indexOf(r.unit) === -1) E(tag + 'unit debe ser reps, s o m.');
-    if (!Number.isInteger(r.week_from) || !Number.isInteger(r.week_to) || r.week_from > r.week_to) E(tag + 'week_from y week_to deben ser números con week_from ≤ week_to.');
+    if (!Number.isInteger(r.week_from) || !Number.isInteger(r.week_to) || r.week_from < 1 || r.week_from > r.week_to) E(tag + 'week_from y week_to deben ser números con 1 ≤ week_from ≤ week_to.');
+    else if (day) {
+      const rtB = RTb.get(day.routine_id); const rtC = db.tables.ROUTINES[day.routine_id];
+      const W = rtB && Number.isInteger(rtB.weeks) ? rtB.weeks : (rtC ? routineWeeks(rtC) : null);
+      if (W != null && r.week_to > W) E(tag + 'week_to (' + r.week_to + ') supera las ' + W + ' semanas de la rutina (ROUTINES.weeks).');
+    }
     const cur = db.tables[REX][r.rex_id];
     if (cur && day) { const cd = db.tables.ROUTINE_DAYS[cur.day_id]; if (cd && cd.routine_id !== day.routine_id) E(tag + 'ese ID ya lo usa otra rutina. Cada bloque necesita IDs nuevos.'); }
   });
@@ -690,8 +763,36 @@ function parseImport(text) {
     days.forEach((d) => { if (!keepDays.has(d.day_id)) removals.days.push(d.day_id); });
     rows(REX).forEach((r) => { if (dayIds.has(r.day_id) && !keepRex.has(r.rex_id)) removals.rex.push(r.rex_id); });
   });
+  /* Cambio de duración de una rutina existente: ajusta lo que el bloque no trae (alargar extiende la última semana, acortar recorta). */
+  const resize = [];
+  const removedRex = new Set(removals.rex);
+  (out.ROUTINES || []).forEach((rt) => {
+    const cur = db.tables.ROUTINES[rt.routine_id]; if (!cur || !Number.isInteger(rt.weeks)) return;
+    const oldN = routineWeeks(cur); if (rt.weeks === oldN) return;
+    const skip = new Set((out.ROUTINE_EXERCISES || []).map((r) => r.rex_id).concat(removals.rex));
+    const ops = planResize(rt.routine_id, oldN, rt.weeks, skip);
+    resize.push({ rid: rt.routine_id, name: rt.name || cur.name, oldN, newN: rt.weeks, ops });
+    ops.drop.forEach((id) => removedRex.add(id));
+  });
+  /* Aviso: semanas que quedarían sin prescripciones en algún día de entrenamiento. */
+  (out.ROUTINES || []).forEach((rt) => {
+    if (!Number.isInteger(rt.weeks)) return;
+    const blockDays = (out.ROUTINE_DAYS || []).filter((d) => d.routine_id === rt.routine_id);
+    const days = blockDays.length ? blockDays : rows('ROUTINE_DAYS').filter((d) => d.routine_id === rt.routine_id);
+    const dayIds = new Set(days.map((d) => d.day_id)); const rs = resize.find((x) => x.rid === rt.routine_id);
+    const ext = new Set(rs ? rs.ops.extend : []), clamp = new Set(rs ? rs.ops.clamp : []);
+    const byId = {};
+    rows(REX).forEach((r) => { if (dayIds.has(r.day_id) && !removedRex.has(r.rex_id)) byId[r.rex_id] = Object.assign({}, r, (ext.has(r.rex_id) || clamp.has(r.rex_id)) ? { week_to: rt.weeks } : {}); });
+    (out.ROUTINE_EXERCISES || []).forEach((r) => { if (dayIds.has(r.day_id)) byId[r.rex_id] = r; });
+    const empty = [];
+    days.filter((d) => d.type !== 'rest').forEach((d) => {
+      const miss = range(rt.weeks).filter((w) => !Object.values(byId).some((r) => r.day_id === d.day_id && (r.week_from || 1) <= w && w <= (r.week_to || 99)));
+      if (miss.length) empty.push('Día ' + d.day_index + ' (semana ' + miss.join(', ') + ')');
+    });
+    if (empty.length) warnings.push('Quedan sin ejercicios: ' + empty.join(', ') + '.');
+  });
   const counts = {}; for (const t in out) counts[t] = out[t].length;
-  return { tables: out, counts, warnings, removals };
+  return { tables: out, counts, warnings, removals, resize };
 }
 
 /* ---------- Revisión automática de datos: ordena lo suelto sin tocar el Sheet a mano ----------
@@ -723,10 +824,19 @@ function planRepair() {
     if (keep.length > 1) plan.notes.push('"' + list[0].name + '" tiene historial en más de un ID (' + keep.map((e) => e.exercise_id).join(', ') + '). No se toca: avisale a Claude en el chat de desarrollo.');
   });
   plan.exercises = live.filter((e) => archive.has(e.exercise_id));
+  plan.range = { drop: [], clamp: [] };
+  rows('ROUTINES').forEach((rt) => {
+    if (delR.has(rt.routine_id)) return;
+    const n = routineWeeks(rt); const busy = weeksWithSessions(rt.routine_id, n);
+    if (busy.length) { plan.notes.push('"' + rt.name + '" tiene entrenamientos en la semana ' + busy.join(', ') + ' pero dura ' + n + ' semanas. Subí las semanas desde Editar rutina.'); return; }
+    const ops = planResize(rt.routine_id, n + 1000, n);
+    ops.drop.forEach((id) => { if (!delX.has(id)) plan.range.drop.push(id); });
+    ops.clamp.forEach((id) => { if (!delX.has(id)) plan.range.clamp.push(id); });
+  });
   const S = db.tables.SESSIONS;
   const orphanSets = rows('SETS').filter((x) => !S[x.session_id] || !EX[x.exercise_id]).length;
   if (orphanSets) plan.notes.push(orphanSets + ' series apuntan a una sesión o ejercicio que no existe. No se tocan porque son historial.');
-  plan.count = plan.routines.length + plan.days.length + plan.rex.length + plan.exercises.length + plan.complete.length;
+  plan.count = plan.routines.length + plan.days.length + plan.rex.length + plan.exercises.length + plan.complete.length + plan.range.drop.length + plan.range.clamp.length;
   return plan;
 }
 function applyRepair(plan) {
@@ -735,6 +845,10 @@ function applyRepair(plan) {
   plan.routines.forEach((r) => softDelete('ROUTINES', r.routine_id));
   plan.exercises.forEach((e) => softDelete('EXERCISES', e.exercise_id));
   plan.complete.forEach((r) => put('ROUTINES', { routine_id: r.routine_id, status: 'completed' }));
+  if (plan.range) {
+    plan.range.drop.forEach((id) => softDelete(REX, id));
+    plan.range.clamp.forEach((id) => { const r = db.tables[REX][id]; const d = r && db.tables.ROUTINE_DAYS[r.day_id]; const rt = d && db.tables.ROUTINES[d.routine_id]; if (rt) put(REX, { rex_id: id, week_to: routineWeeks(rt) }); });
+  }
 }
 function repairItems(plan) {
   const L = [];
@@ -743,6 +857,7 @@ function repairItems(plan) {
   if (plan.rex.length) L.push(plan.rex.length + ' prescripción(es) sueltas (sin día o sin ejercicio)');
   if (plan.exercises.length) L.push(plan.exercises.length + ' ejercicio(s) duplicados o incompletos sin historial: ' + plan.exercises.map((e) => e.name || e.exercise_id).join(', '));
   if (plan.complete.length) L.push('Había más de una rutina activa: ' + plan.complete.map((r) => r.name).join(', ') + ' pasa(n) a completada(s)');
+  if (plan.range && (plan.range.drop.length || plan.range.clamp.length)) L.push((plan.range.drop.length + plan.range.clamp.length) + ' prescripción(es) que pasaban del final de su rutina (ajustadas a sus semanas)');
   return L;
 }
 function applyImport(p) {
@@ -751,21 +866,31 @@ function applyImport(p) {
     const c = stripMeta(r); c.deleted_at = null;
     if (t === REX) { if (c.reps != null) c.reps = String(c.reps); if (c.rir != null) c.rir = String(c.rir); }
     if (t === 'PROFILE' && c.value != null) c.value = String(c.value);
+    if (t === 'ROUTINES') {
+      const cur = db.tables.ROUTINES[c.routine_id];
+      if (normDate(c.start_date)) c.start_date = normDate(c.start_date);
+      else if (cur && normDate(cur.start_date)) delete c.start_date;
+      else if (cur && routineStart(cur)) c.start_date = routineStart(cur);
+      else if (c.status === 'active') c.start_date = todayLocal();
+      else c.start_date = null;
+    }
     put(t, c);
   }));
   if (newActive.length) rows('ROUTINES').forEach((r) => { if (r.status === 'active' && newActive.indexOf(r.routine_id) === -1) put('ROUTINES', { routine_id: r.routine_id, status: 'completed' }); });
   if (p.removals) { p.removals.rex.forEach((id) => softDelete(REX, id)); p.removals.days.forEach((id) => softDelete('ROUTINE_DAYS', id)); }
+  (p.resize || []).forEach((x) => applyResize(x.ops));
   const plan = planRepair(); applyRepair(plan);
   ui.week = null; ui.editWeek = null;
   changed(true);
   return plan;
 }
 function buildSummary() {
-  const L = []; const bw = bodyweight();
+  const L = [];
   L.push('RESUMEN STREETLIFTING — ' + todayLocal());
-  L.push('Peso corporal: ' + (bw != null ? fmt(bw) + ' kg' : 'sin dato'));
+  weightSummary().forEach((x) => L.push(x));
   L.push('Máximos de referencia: ' + MAIN_LIFTS.map(([id]) => exName(id) + ' ' + (mainMax(id) != null ? (isAdded(id) ? '+' : '') + fmt(mainMax(id)) + ' kg' : '—')).join(' | '));
-  const rt = activeRoutine(); if (rt) L.push('Bloque activo: ' + rt.name + ' (semana ' + currentWeek(rt) + ' de ' + (rt.weeks || 4) + ')');
+  const rt = activeRoutine();
+  if (rt) { const cw = currentWeek(rt); const lb = weekLabels(rt)[cw - 1]; const st = routineStart(rt); L.push('Bloque activo: ' + rt.name + ' — semana ' + cw + ' de ' + routineWeeks(rt) + (lb ? ' (' + lb + ')' : '') + (st ? ' · inicio ' + st : '')); }
   const since = minusDays(todayLocal(), 56);
   const sess = rows('SESSIONS').filter((s) => (s.date || '') >= since).sort((a, b) => (a.date || '').localeCompare(b.date || '') || (a.created_at || '').localeCompare(b.created_at || ''));
   L.push(''); L.push('SESIONES (últimas 8 semanas)');
@@ -788,7 +913,8 @@ function buildSummary() {
   L.push(''); L.push('FORMATO PARA IMPORTAR EL PRÓXIMO BLOQUE EN LA APP');
   L.push('JSON: {"format":"streetlifting-block-v1","tables":{...}}. IDs nuevos y únicos en cada bloque (ej. rtn_b3, day_b3_1, rex_b3_d1_01_w1); nunca reutilizar IDs de bloques anteriores.');
   L.push('Para MODIFICAR la rutina activa: mandá la rutina completa con los mismos IDs (su fila de ROUTINES + todos sus días + todas sus prescripciones). Lo que no venga en el bloque se quita solo (sin borrar historial). Si mandás solo algunas filas sin los días, se actualizan esas y no se quita nada.');
-  L.push('ROUTINES: routine_id, name, weeks (entero), week_labels ("A|B|C|D"), status ("active"), start_date (YYYY-MM-DD), notes');
+  L.push('ROUTINES: routine_id, name, weeks (entero de 1 a 16, la duración real del bloque), week_labels (una etiqueta por semana separadas por "|", tantas como weeks), status ("active"), start_date (YYYY-MM-DD, primer día de la semana 1: la app calcula la semana actual con ella), notes');
+  L.push('Regla de semanas: en ROUTINE_EXERCISES, 1 ≤ week_from ≤ week_to ≤ weeks. Para alargar o acortar la rutina activa, cambiá weeks y mandá la rutina completa con los mismos IDs; si no se puede (por ejemplo, acortar por debajo de una semana ya entrenada), la app lo rechaza y explica por qué.');
   L.push('ROUTINE_DAYS: day_id, routine_id, day_index (entero), name, type (heavy|tech|rest), cue (indicación técnica)');
   L.push('ROUTINE_EXERCISES: rex_id, day_id, exercise_id, week_from, week_to, position, role (' + codesOf(ROLES).join('|') + '), sets, reps (texto: "5" o "8-10"), unit (reps|s|m), load_type (pct|kg|added_kg|bodyweight|null), load_value, pct_of (solo con pct: ' + rows('PROFILE').map((p) => p.key).filter((k) => k.indexOf('ref_max.') === 0).map((k) => k.slice(8)).join('|') + '), rir (texto), rest_sec, notes');
   L.push('EXERCISES (solo ejercicios nuevos): exercise_id, name, category, type (' + codesOf(EX_TYPES).join('|') + '), load_mode (' + codesOf(LOAD_MODES).join('|') + '), notes');
@@ -816,12 +942,12 @@ function hero() {
   bits.push('<button class="linkbtn" data-act="bw">' + (bw != null ? fmt(bw) + ' kg' : 'cargar peso') + '</button>');
   if (arm) bits.push('brazo muñeca-hombro ' + esc(arm) + ' cm');
   if (anth) bits.push(esc(String(anth).toLowerCase()));
-  return '<header class="hero"><p class="eyebrow">' + esc(activeRoutine() ? activeRoutine().name : 'Bloque de fuerza') + ' · ' + ((activeRoutine() && activeRoutine().weeks) || 4) + (((activeRoutine() && activeRoutine().weeks) || 4) === 1 ? ' semana' : ' semanas') + '</p>' +
+  return '<header class="hero"><p class="eyebrow">' + (activeRoutine() ? esc(activeRoutine().name) + ' · semana ' + currentWeek(activeRoutine()) + ' de ' + routineWeeks(activeRoutine()) : 'Bloque de fuerza') + '</p>' +
     '<h1 class="total display"><span class="totalnum">' + fmt(total) + '</span><span class="totalunit">kg</span></h1>' +
     '<p class="totallabel">Total estimado — sentadilla + dominada lastrada + fondo lastrado + muscle up lastrado</p><div class="maxgrid">' +
     MAIN_LIFTS.map(([id, l]) => { const v = mainMax(id); return '<label>' + l + '<input type="number" step="0.5" inputmode="decimal" data-max="' + id + '" value="' + (v == null ? '' : fmt(v)) + '"' + (v === 0 ? ' class="zero"' : '') + '></label>'; }).join('') +
     '</div><p class="bodystats">' + bits.join(' · ') + '</p>' +
-    '<p class="footnote">Máximos de referencia estimados con Epley. En dominadas, fondos y muscle up el porcentaje se calcula sobre peso corporal + lastre. Editalos cuando tengas una marca real o retestees en la semana 4.</p></header>';
+    '<p class="footnote">Máximos de referencia estimados con Epley. En dominadas, fondos y muscle up el porcentaje se calcula sobre peso corporal + lastre. Editalos cuando tengas una marca real o retestees al final del bloque.</p></header>';
 }
 function rexLine(r, date) {
   const cls = r.role === 'main' ? 'main' : r.role === 'skill' ? 'mu' : (r.role === 'technique' || r.role === 'mobility') ? 'extra' : '';
@@ -847,12 +973,12 @@ function dayCard(d, w) {
 function viewHome() {
   const rt = activeRoutine();
   if (!rt) return topbar() + '<p class="note">No hay una rutina activa todavía. Si acabás de conectar, esperá la sincronización o importá un bloque desde "Editar rutina".</p>';
-  const W = rt.weeks || 4;
+  const W = routineWeeks(rt);
   if (!ui.week || ui.week > W) ui.week = currentWeek(rt);
-  const labels = weekLabels(rt);
+  const labels = weekLabels(rt); const cw = currentWeek(rt);
   return topbar() + hero() +
-    '<nav class="weeknav">' + range(W).map((w) => '<button class="wtab' + (w === ui.week ? ' active' : '') + '" data-act="week" data-w="' + w + '">' + w + '</button>').join('') + '</nav>' +
-    '<p class="weekfocus">Semana ' + ui.week + (labels[ui.week - 1] ? ' — ' + esc(labels[ui.week - 1]) : '') + '</p>' +
+    '<nav class="weeknav' + (W > 6 ? ' many' : '') + '">' + range(W).map((w) => '<button class="wtab' + (w === ui.week ? ' active' : '') + (w === cw ? ' now' : '') + '" data-act="week" data-w="' + w + '"' + (w === cw ? ' aria-label="Semana ' + w + ', semana actual"' : '') + '>' + w + '</button>').join('') + '</nav>' +
+    '<p class="weekfocus">Semana ' + ui.week + ' de ' + W + (labels[ui.week - 1] ? ' — ' + esc(labels[ui.week - 1]) : '') + (ui.week === cw ? ' · semana actual' : '') + '</p>' +
     '<div class="days">' + routineDays(rt.routine_id).map((d) => dayCard(d, ui.week)).join('') + '</div>' +
     (rt.notes ? '<p class="warmup">' + esc(rt.notes) + '</p>' : '');
 }
@@ -1000,10 +1126,13 @@ function viewLibrary() {
 function viewEdit() {
   const rt = activeRoutine();
   if (!rt) return backbar('home') + '<h2 class="vtitle">Editar rutina</h2><p class="note">No hay rutina activa.</p><button class="btn block" data-act="import">Importar bloque</button>';
-  const W = rt.weeks || 4; if (!ui.editWeek || ui.editWeek > W) ui.editWeek = ui.week || currentWeek(rt);
+  const W = routineWeeks(rt); if (!ui.editWeek || ui.editWeek > W) ui.editWeek = Math.min(W, ui.week || currentWeek(rt));
+  const start = routineStart(rt); const labels = weekLabels(rt);
   const N = ui.editWeek;
   let h = backbar('home') + '<h2 class="vtitle">Editar rutina</h2><p class="vsub">' + esc(rt.name) + '. Los cambios se aplican desde la semana elegida en adelante. Lo que ya registraste no cambia. Para un cambio de un solo día (máquina ocupada, molestia), usá "Cambiar hoy" al registrar.</p>' +
-    '<p class="eyebrow">Aplicar cambios desde la semana</p><nav class="weeknav" style="padding-top:0">' + range(W).map((w) => '<button class="wtab' + (w === N ? ' active' : '') + '" data-act="editweek" data-w="' + w + '">' + w + '</button>').join('') + '</nav><div class="days" style="margin-top:16px">';
+    '<div class="panel" style="margin:0 0 16px"><h3>Duración del bloque</h3><p class="note">' + W + (W === 1 ? ' semana' : ' semanas') + ' · inicio ' + (start ? fmtDate(start) + (normDate(rt.start_date) ? '' : ' (primera sesión)') : 'sin fecha') + ' · hoy es la semana ' + currentWeek(rt) +
+    (labels.filter(Boolean).length ? '<br>' + range(W).map((w) => w + '. ' + esc(labels[w - 1] || '—')).join(' · ') : '') + '</p><button class="btn block" data-act="edit-routine">Cambiar semanas, etiquetas o inicio</button></div>' +
+    '<p class="eyebrow">Aplicar cambios desde la semana</p><nav class="weeknav' + (W > 6 ? ' many' : '') + '" style="padding-top:0">' + range(W).map((w) => '<button class="wtab' + (w === N ? ' active' : '') + '" data-act="editweek" data-w="' + w + '">' + w + '</button>').join('') + '</nav><div class="days" style="margin-top:16px">';
   routineDays(rt.routine_id).forEach((d) => {
     const list = rexFor(d.day_id, N);
     h += '<section class="day ' + esc(d.type) + '"><header class="dayhead"><div class="dayid"><span class="dnum">Día ' + d.day_index + '</span><span class="dtag">' + esc(DAYTYPE_LABEL[d.type] || d.type) + '</span></div>' +
@@ -1029,6 +1158,7 @@ function viewSettings() {
     h += '<div class="panel"><h3>Sincronización</h3><p class="note">Estado: ' + SYNC_LABEL[syncState.state] + '<br>Cambios pendientes: ' + pendingCount() +
       '<br>Última sincronización: ' + (db.meta.lastSyncAt || db.meta.lastPullAt ? new Date(db.meta.lastSyncAt > (db.meta.lastPullAt || '') ? db.meta.lastSyncAt : db.meta.lastPullAt).toLocaleString('es-AR') : 'nunca') +
       (syncState.lastError ? '<br>Último error: ' + esc(syncState.lastError) : '') + '</p><button class="btn block" data-act="syncnow">Sincronizar ahora</button></div>' +
+      '<div class="panel"><h3>Peso corporal</h3><p class="note">' + (bodyweight() != null ? 'Último: ' + fmt(bodyweight()) + ' kg (' + fmtDate(normDate(weightLog().slice(-1)[0].date)) + ') · ' + weightLog().length + ' registros' : 'Sin registros todavía.') + '</p><button class="btn block" data-act="bw">Registrar peso</button></div>' +
       '<div class="panel"><h3>Claude</h3><p class="note">Copiá tu historial reciente para pegarlo en el chat y que Claude evalúe tu evolución o arme el próximo bloque.</p><button class="btn block" data-act="export">Copiar resumen para Claude</button></div>' +
       '<div class="panel"><h3>Revisar datos</h3><p class="note">Busca datos sueltos (importaciones fallidas, duplicados) y los ordena desde la app. Nunca hace falta editar el Sheet a mano.</p><button class="btn block" data-act="check-data">Revisar datos</button></div>' +
       '<div class="panel"><h3>Respaldo</h3><p class="note">Tu fuente permanente es el Google Sheet. Esto descarga además una copia local en JSON.</p><button class="btn block" data-act="backup">Descargar respaldo</button></div>';
@@ -1087,6 +1217,23 @@ function modalHtml(m) {
     return '<h3>Ejercicio extra</h3><label class="field">Ejercicio<select id="f-extra">' + exOptions('', false) + '</select></label>' +
       '<div class="sheetbtns"><button class="btn ghost" data-act="close-modal">Cancelar</button><button class="btn primary" data-act="save-extra">Agregar</button></div>';
   }
+  if (m.type === 'routine') {
+    const rt = db.tables.ROUTINES[m.rid]; const oldN = routineWeeks(rt);
+    const dr = m.draft; const n = dr.weeks;
+    const ok = Number.isInteger(n) && n >= 1 && n <= 16;
+    const busy = ok && n < oldN ? weeksWithSessions(rt.routine_id, n) : [];
+    let info = '';
+    if (ok && n !== oldN && !busy.length) info = resizeText(planResize(rt.routine_id, oldN, n), oldN, n) + ' Tu historial no se toca.';
+    return '<h3>Duración del bloque</h3>' +
+      '<div class="row2"><label class="field">Semanas<input id="f-rweeks" type="number" inputmode="numeric" min="1" max="16" value="' + esc(n == null ? '' : n) + '"></label>' +
+      '<label class="field">Inicio (día 1 de la semana 1)<input id="f-rstart" type="date" value="' + esc(dr.start || '') + '"></label></div>' +
+      (ok ? range(n).map((w) => '<label class="field">Etiqueta semana ' + w + '<input type="text" data-wlabel="' + w + '" value="' + esc(dr.labels[w - 1] || '') + '" placeholder="Ej.: Acumulación"></label>').join('') : '') +
+      (info ? '<p class="msg" style="margin-top:0">' + esc(info) + '</p>' : '') +
+      (busy.length ? '<p class="msg err">Ya registraste entrenamientos en la semana ' + busy.join(', ') + '. No se puede acortar a ' + n + ' semanas sin dejarlos fuera de la rutina.</p>' : '') +
+      (!ok ? '<p class="msg err">Elegí entre 1 y 16 semanas.</p>' : '') + (m.err ? '<p class="msg err">' + esc(m.err) + '</p>' : '') +
+      '<p class="msg">La semana actual se calcula con la fecha de inicio: ((hoy − inicio) / 7) + 1.</p>' +
+      '<div class="sheetbtns"><button class="btn ghost" data-act="close-modal">Cancelar</button><button class="btn primary" data-act="save-routine"' + (!ok || busy.length ? ' disabled' : '') + '>Guardar</button></div>';
+  }
   if (m.type === 'day') {
     const d = db.tables.ROUTINE_DAYS[m.dayId];
     return '<h3>Editar día ' + d.day_index + '</h3><label class="field">Nombre<input id="f-dname" type="text" value="' + esc(d.name) + '"></label>' +
@@ -1095,9 +1242,20 @@ function modalHtml(m) {
       '<div class="sheetbtns"><button class="btn ghost" data-act="close-modal">Cancelar</button><button class="btn primary" data-act="save-day">Guardar</button></div>';
   }
   if (m.type === 'bw') {
-    return '<h3>Peso corporal</h3><div class="row2"><label class="field">Peso (kg)<input id="f-bw" type="number" step="0.1" inputmode="decimal" value="' + esc(fmt(bodyweight())) + '"></label>' +
-      '<label class="field">Fecha<input id="f-bwdate" type="date" value="' + todayLocal() + '"></label></div><p class="msg" style="margin-top:0">Se guarda como un registro nuevo: tu evolución de peso queda en el historial y se usa para calcular las cargas de dominadas y fondos.</p>' +
-      '<div class="sheetbtns"><button class="btn ghost" data-act="close-modal">Cancelar</button><button class="btn primary" data-act="save-bw">Guardar</button></div>';
+    const log = weightLog(); const desc = log.slice().reverse();
+    let h = '<h3>Peso corporal</h3><div class="row2"><label class="field">Peso (kg)<input id="f-bw" type="number" step="0.1" inputmode="decimal" value="' + esc(fmt(bodyweight())) + '"></label>' +
+      '<label class="field">Fecha<input id="f-bwdate" type="date" value="' + todayLocal() + '"></label></div>' +
+      (m.saved ? '<p class="msg" style="margin-top:0">Guardado: ' + esc(m.saved) + '.</p>' : '<p class="msg" style="margin-top:0">Cada registro queda con su fecha en tu Sheet (un registro por día). Se usa para las cargas de dominadas, fondos y muscle up, y va en el resumen para Claude.</p>') +
+      '<div class="sheetbtns"><button class="btn ghost" data-act="close-modal">' + (m.saved ? 'Cerrar' : 'Cancelar') + '</button><button class="btn primary" data-act="save-bw">Guardar</button></div>';
+    if (log.length > 1) h += '<div class="chartbox" style="margin-top:16px">' + chartSvg(log.slice(-20).map((x) => ({ label: fmtDate(normDate(x.date)), w: x.value })), [{ key: 'w', label: 'Peso (kg)', color: 'var(--tech)' }]) + '</div>';
+    if (desc.length) {
+      h += '<p class="eyebrow" style="margin-top:16px">Historial</p><div class="sesslist" style="margin-top:6px">' + desc.slice(0, 30).map((x, i) => {
+        const prev = desc[i + 1]; const dlt = prev ? Math.round((x.value - prev.value) * 10) / 10 : null;
+        return '<div class="sessitem"><div class="sesshead"><b>' + fmt(x.value) + ' kg</b><span>' + fmtDate(normDate(x.date)) + (dlt ? ' · ' + (dlt > 0 ? '+' : '') + fmt(dlt) + ' kg' : '') +
+          ' <button class="xbtn" style="height:26px;width:26px;margin-left:6px" data-act="del-bw" data-id="' + esc(x.metric_id) + '" aria-label="Borrar registro">✕</button></span></div></div>';
+      }).join('') + '</div>';
+    }
+    return h;
   }
   if (m.type === 'import') {
     let h = '<h3>Importar bloque</h3><label class="field">Pegá el bloque que te dio Claude<textarea id="f-import" rows="8" placeholder=\'{"format":"streetlifting-block-v1","tables":{…}}\'>' + esc(m.text || '') + '</textarea></label>';
@@ -1111,6 +1269,7 @@ function modalHtml(m) {
       }));
       h += '<p class="msg">Ya no están en el bloque y se van a quitar de la rutina (el historial que registraste se conserva):</p><ul class="msglist">' + items.slice(0, 15).map((x) => '<li>' + esc(x) + '</li>').join('') + (items.length > 15 ? '<li>…y ' + (items.length - 15) + ' más.</li>' : '') + '</ul>';
     }
+    if (m.parsed && m.parsed.resize && m.parsed.resize.length) h += '<ul class="msglist">' + m.parsed.resize.map((x) => '<li>' + esc(x.name + ': ' + resizeText(x.ops, x.oldN, x.newN) + ' Tu historial no se toca.') + '</li>').join('') + '</ul>';
     if (m.parsed && m.parsed.warnings && m.parsed.warnings.length) h += '<ul class="msglist">' + m.parsed.warnings.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>';
     return h + '<div class="sheetbtns"><button class="btn ghost" data-act="close-modal">Cancelar</button>' +
       (m.parsed && !m.parsed.error ? '<button class="btn primary" data-act="import-apply">Importar</button>' : '<button class="btn primary" data-act="import-check">Revisar</button>') + '</div>';
@@ -1233,7 +1392,7 @@ document.addEventListener('click', async (e) => {
       if (!exId || exId === '__new') { ui.modal.err = 'Elegí un ejercicio.'; ui.modal.draft = readRexForm(); renderModal(); return; }
       const patch = readRexForm();
       if (ui.modal.rexId) forwardEdit(ui.modal.rexId, patch, ui.editWeek);
-      else { const rt = activeRoutine(); put(REX, Object.assign({ rex_id: uid('rex'), week_from: ui.editWeek, week_to: rt.weeks || 4, position: nextPos(patch.day_id, ui.editWeek) }, patch)); }
+      else { const rt = activeRoutine(); put(REX, Object.assign({ rex_id: uid('rex'), week_from: ui.editWeek, week_to: routineWeeks(rt), position: nextPos(patch.day_id, ui.editWeek) }, patch)); }
       changed(false); closeModal(); render(); break;
     }
     case 'newex': openModal({ type: 'exform' }); break;
@@ -1252,13 +1411,28 @@ document.addEventListener('click', async (e) => {
     case 'archive-ex': softDelete('EXERCISES', ui.modal.exId); changed(false); closeModal(); render(); break;
     case 'restore-ex': put('EXERCISES', { exercise_id: ui.modal.exId, deleted_at: null }); changed(false); closeModal(); render(); break;
     case 'edit-day': openModal({ type: 'day', dayId: d.day }); break;
+    case 'edit-routine': { const rt = activeRoutine(); if (!rt) return; openModal({ type: 'routine', rid: rt.routine_id, draft: { weeks: routineWeeks(rt), start: normDate(rt.start_date) || '', labels: weekLabels(rt) } }); break; }
+    case 'save-routine': {
+      readRoutineDraft(); const m = ui.modal; const rt = db.tables.ROUTINES[m.rid]; const oldN = routineWeeks(rt); const n = m.draft.weeks;
+      if (!Number.isInteger(n) || n < 1 || n > 16 || (n < oldN && weeksWithSessions(rt.routine_id, n).length)) { renderModal(); return; }
+      if (m.draft.start && !normDate(m.draft.start)) { m.err = 'La fecha de inicio no es válida.'; renderModal(); return; }
+      applyResize(planResize(rt.routine_id, oldN, n));
+      put('ROUTINES', { routine_id: rt.routine_id, weeks: n, week_labels: range(n).map((w) => (m.draft.labels[w - 1] || '').replace(/\|/g, '/').trim()).join('|'), start_date: m.draft.start || null });
+      ui.week = null; ui.editWeek = null; changed(true); closeModal(); render(); break;
+    }
     case 'save-day': put('ROUTINE_DAYS', { day_id: ui.modal.dayId, name: val('f-dname').trim() || db.tables.ROUTINE_DAYS[ui.modal.dayId].name, type: val('f-dtype'), cue: val('f-cue').trim() || null }); changed(false); closeModal(); render(); break;
     case 'bw': openModal({ type: 'bw' }); break;
     case 'save-bw': {
       const v = num(val('f-bw')); const date = val('f-bwdate') || todayLocal(); if (v == null) return;
       const same = rows('BODY_METRICS').find((m) => m.metric === 'weight_kg' && m.date === date);
+      if (v < 30 || v > 250) return;
       put('BODY_METRICS', same ? { metric_id: same.metric_id, value: v } : { metric_id: uid('bm'), date, metric: 'weight_kg', value: v, notes: null });
-      changed(false); closeModal(); render(); break;
+      changed(true); ui.modal = { type: 'bw', saved: fmt(v) + ' kg el ' + fmtDate(date) }; renderModal(); render(); break;
+    }
+    case 'del-bw': {
+      const x = db.tables.BODY_METRICS[d.id]; if (!x) return;
+      if (confirm('¿Borrar el registro de ' + fmt(x.value) + ' kg del ' + fmtDate(normDate(x.date)) + '?')) { softDelete('BODY_METRICS', d.id); changed(false); ui.modal = { type: 'bw' }; renderModal(); render(); }
+      break;
     }
     case 'import': openModal({ type: 'import' }); break;
     case 'import-check': { const text = val('f-import'); openModal({ type: 'import', text, parsed: parseImport(text) }); break; }
@@ -1291,6 +1465,11 @@ document.addEventListener('click', async (e) => {
     }
   }
 });
+function readRoutineDraft() {
+  const m = ui.modal; if (!m || m.type !== 'routine') return;
+  document.querySelectorAll('[data-wlabel]').forEach((el) => { m.draft.labels[+el.dataset.wlabel - 1] = el.value; });
+  const n = int(val('f-rweeks')); m.draft.weeks = n; m.draft.start = val('f-rstart'); m.err = null;
+}
 function readRexForm() {
   const lt = val('f-lt');
   return { exercise_id: val('f-ex') === '__new' ? '' : val('f-ex'), day_id: val('f-day'), sets: int(val('f-sets')), reps: val('f-reps').trim() || null,
@@ -1310,6 +1489,7 @@ document.addEventListener('change', (e) => {
     put('SESSIONS', { session_id: s.session_id, [d.sessfield]: el.value || (d.sessfield === 'date' ? todayLocal() : null) }); changed(false); return;
   }
   if (d.max) { const v = num(el.value); if (v == null) return; put('PROFILE', { key: 'ref_max.' + d.max, value: String(v) }); changed(false); render(); return; }
+  if (el.id === 'f-rweeks' && ui.modal && ui.modal.type === 'routine') { readRoutineDraft(); renderModal(); return; }
   if (el.id === 'f-ex' && el.value === '__new' && ui.modal && ui.modal.type === 'rex') {
     const draft = readRexForm(); ui.modal.draft = draft;
     openModal({ type: 'exform', returnTo: ui.modal });
